@@ -1,5 +1,72 @@
 # Star
 
+# Speculative Decoding
+
+# Overview
+
+# Speculative Decoding: Training & Inference Overview (broader view)
+
+
+## The core idea (Leviathan et al. 2023 / Chen et al. 2023, "Accelerating LLM Decoding with Speculative Sampling")
+
+A cheap draft model proposes tokens; the expensive target model verifies them in one parallel pass; rejection sampling guarantees the final output distribution matches what the target would have produced alone. This dual-model formulation is the ancestor of nearly everything below.
+
+## Training-side taxonomy (how the draft signal is obtained)
+
+- **Independent draft model** — a genuinely separate, smaller LM (often same family, sometimes distilled specifically for this job: DistillSpec trains the drafter to match the target's *output distribution* directly rather than ground truth, using the target's own samples). Pro: fully decoupled, drop-in. Con: alignment is never perfect; tokenizer/vocab must match the target exactly.
+- **Attached head, no full model** — **Medusa** adds multiple parallel decoding heads on top of the *frozen* target's last hidden state, each head predicting a different future position independently, then verifies with a tree; **EAGLE** instead adds one autoregressive feature-predicting layer (sequential, not parallel heads) — the distinction between "parallel heads" (Medusa, Hydra, Recurrent Drafter) and "sequential feature autoregression" (EAGLE) is itself a major taxonomic split, with sequential methods generally reaching higher acceptance length because they preserve inter-token dependency, while parallel-head methods are cheaper per step but suffer the same "suffix decay" problem raised later in production systems.
+- **Retrieval / non-parametric drafting, no training at all** — **Prompt Lookahead Decoding (PLD)** and **REST** skip training entirely: draft tokens are pulled from n-gram matches in the prompt/context (PLD) or retrieved from a datastore of past generations (REST). Pro: zero training cost, works instantly on any target. Con: only helps when the output has textual overlap with available context (great for RAG/code-editing tasks with heavy copying, weak for open-ended novel generation).
+- **Parallel decoding without a separate drafter, via masking** — **Lookahead Decoding** (Fu et al. 2024) generates and verifies n-grams using Jacobi-iteration-style parallel guesses, no draft model or extra training required, trading some speedup for zero additional parameters.
+- **Self-drafting** — covered below as its own section.
+
+## Inference-side taxonomy (how drafts are structured/verified)
+
+- **Chain drafting** — one linear sequence of k draft tokens, verified once (original formulation).
+- **Tree drafting** — multiple candidate continuations verified simultaneously in a single batched forward pass via a tree-structured attention mask (**SpecInfer** pioneered tree-based speculative inference and verification at the systems level; **EAGLE-2** made the tree *dynamic*, i.e. its shape adapts to per-step confidence rather than a fixed shape; **OPT-Tree** learns/searches the optimal tree structure per model pair). Pro: much higher expected accepted length per target pass than a chain of the same token budget. Con: verification cost and complexity grow with tree width; naively wide trees waste target compute on low-probability branches.
+- **Batch-aware verification** — in production serving (not just single-request benchmarks), draft token count interacts badly with batch size: verifying long per-request trees at high concurrency starves batch capacity (this is a recognized failure mode across multiple 2024–2026 systems papers, addressed by adaptive/dynamic speculation lookahead and load-aware schedulers).
+
+## General pros (across the whole paradigm)
+
+- **Losslessness** — when verification uses proper rejection sampling, the marginal output distribution is provably identical to the target alone; this is what separates speculative decoding from early-exit or distillation approaches that *do* change outputs.
+- **Wall-clock, not FLOPs** — the win exploits the fact that LLM decoding is memory-bandwidth-bound, not compute-bound; verifying k tokens in parallel costs barely more than verifying one, so "wasted" compute on rejected drafts is nearly free relative to latency.
+- **Stacks with everything else** — quantization, KV-cache compression, continuous batching, and speculative decoding are largely orthogonal and combine.
+
+## General cons (across the whole paradigm)
+
+- **Heterogeneous gains** — speedup is highly task- and content-dependent: high on repetitive/predictable text (code, structured output, retrieval-heavy answers), low on creative or high-entropy generation. Benchmarks like **Spec-Bench** were built specifically because early papers reported speedups under wildly inconsistent conditions, making cross-paper comparison unreliable.
+- **Systems complexity compounds with scale** — the single-request speedup story (batch size 1, one GPU) frequently doesn't survive contact with production serving: batching, scheduling, and memory pressure interact with drafting in ways that erode or invert the benefit unless specifically engineered for (a recurring theme across systems-focused papers).
+- **No free lunch on drafter cost** — every drafting scheme pays *something* (extra parameters, extra forward passes, retrieval lookups, or masked-parallel-decode overhead); the entire research area is fundamentally about minimizing that something relative to the τ (accepted length) it buys.
+
+---
+
+# Self-Speculative Decoding
+
+## The general framework
+
+The target model drafts for itself, with no separate model:
+
+- **Layer-skipping** (LayerSkip; also the original "self-speculative decoding" framing by Zhang et al. 2023, and **Draft & Verify**, ACL 2024): draft by exiting early at layer E (skip the rest), then verify by running the remaining layers on the drafted tokens, reusing the early layers' KV-cache/activations across both passes.
+- **Adaptive/learned exit selection** (**Kangaroo**, "double early exiting"): rather than a single fixed exit layer trained in from scratch, Kangaroo adds a lightweight adapter after an early layer and learns *when* to trust the early-exit prediction vs. fall through to full depth — a second early-exit decision at the token level, not just the model level.
+- **Retrieval/mask-based self-drafting** (PLD, REST, Lookahead Decoding): arguably also "self-speculative" in spirit — no auxiliary trained model, the base model (or the raw prompt/datastore) supplies drafts.
+- **Sparse/structured self-drafting** (**SWIFT**): dynamically chooses which layers to skip per input on the fly rather than fixing E at training time, aiming to avoid retraining the target at all.
+
+## Pros
+
+- **Zero extra parameters / single checkpoint** — nothing to host besides the target; deployment stays simple (no separate drafter lifecycle, no tokenizer-matching risk).
+- **Perfect cache sharing by construction** — layers before the exit point are computed once and reused for both draft and verify; there's no cross-model alignment problem to solve at all, unlike independent-drafter methods where feature/KV mismatch is a constant engineering battle.
+- **No drafter drift risk** — since draft and target share weights, there's no separate model that can fall out of sync as the target is fine-tuned/updated (a real operational cost for two-model setups in production).
+- **Some variants need no retraining at all** — SWIFT-style layer-skipping and PLD/REST/Lookahead-Decoding self-drafting can be applied to an off-the-shelf checkpoint with no training investment, trading some speedup for zero setup cost.
+
+## Cons
+
+- **Trained variants require modifying the target itself** — LayerSkip-style approaches need layer dropout + early-exit loss baked into (re)training; this is a heavier, riskier intervention than bolting on a small external head, and it's not something you can apply to a model you don't control the training pipeline for.
+- **Lower speedup ceiling in practice** — reported gains for early-exit/self-speculative methods (roughly 1.4–2.3× across the survey's tabulated results) generally trail the best independent-drafter tree methods (EAGLE-family: ~2.9–3.6×+), because early layers of a shared model are a compromise representation, not a specialist trained purely to predict.
+- **Exit-point rigidity** — the skip depth is largely a training-time or heuristic choice; adapting it per-input (Kangaroo, SWIFT) helps but adds its own overhead (an adapter/gating decision at every step) and complexity.
+- **Harder to decouple engineering from modeling** — because draft and verify share the same weights and cache, changes to improve one (e.g., widening the tree, extending draft length) interact directly with the target's own serving path, unlike a separate drafter that can be iterated on independently.
+
+---
+
+**The one-line contrast:** independent-drafter methods buy higher acceptance length by specializing a dedicated (possibly trained-from-scratch-feeling) component, at the cost of a second model to align and maintain; self-speculative methods buy architectural simplicity and free cache sharing by drafting from a compromise position inside the target itself, at the cost of a lower speedup ceiling and (for trained variants) having to modify the target's own training.
 
 
 # Paper 1 — EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty (arXiv:2401.15077, ICML 2024)
@@ -238,6 +305,43 @@ No offline distillation corpus: visual-instruction prompts (LLaVA-style data) ar
 
 ---
 
+# Paper 14 — DSpark**(DeepSeek, June 2026 — released with the open-source DeepSpec training/eval stack)**
+
+**1. Challenges it's trying to solve**
+
+Two production failure modes of speculative decoding at serving scale:
+
+- **Suffix decay in parallel drafters.** Parallel/block drafters (DFlash/MTP-style) propose a whole block in one forward pass, but each position is predicted without seeing its neighbors — so acceptance probability decays rapidly toward the end of the block. Autoregressive drafters (EAGLE-3) don't decay but pay per-token drafting latency.
+- **Verification waste under high concurrency.** Verifying long fixed-length draft blocks for every request burns batch capacity on tokens that were likely to be rejected anyway. In a busy serving system this degrades throughput badly — baselines hit an "operational cliff" under strict per-user speed SLAs.
+
+**2. Methods**
+
+- **Semi-autoregressive generation:** a heavy *parallel* drafting backbone coupled with a lightweight *sequential* module (a low-rank "Markov head") that injects intra-block dependencies — later draft tokens get conditioned on earlier ones, mitigating suffix decay at almost no added latency. The best of both drafter families.
+- **Confidence-scheduled verification:** a calibrated confidence head estimates each draft prefix's *survival probability*; combined with engine-specific throughput profiles and live GPU load, the scheduler dynamically tailors the verification length per request — short verification for shaky drafts, long for confident ones, and globally load-aware.
+- **Zero-Overhead Scheduling (ZOS):** the prefix scheduler runs asynchronously, estimating upcoming verification capacity from confidence outputs two steps earlier so the GPU pipeline never stalls waiting for scheduling decisions.
+- **Training-system engineering:** target activations are cached and only pre-LM-head hidden states are communicated (O(d) communication), and *anchor-bounded sequence packing* bundles isolated prediction blocks into dense training batches — decoupling drafter training cost from the target's long contexts.
+
+Verification uses standard rejection sampling, so output distribution is provably identical to vanilla decoding (lossless).
+
+**3. Loss**
+
+Drafter: distillation-style training as in the EAGLE-3/DFlash lineage — cross-entropy of the semi-autoregressive drafter's predictions against the target model's outputs/hidden-state supervision (with the sequential Markov head trained jointly to model intra-block dependencies). Plus a separate **calibrated confidence objective** for the confidence head, trained so its scores track actual prefix acceptance/survival probabilities (calibration is what makes the scheduler's cost-benefit math valid).
+
+**4. Training data**
+
+Target-model-derived training corpora built through the DeepSpec stack (cached target activations over training text; no human-labeled data needed), applied to open targets — three Qwen3 model sizes (also Gemma supported in DeepSpec) — and to DeepSeek-V4 (V4-Flash / V4-Pro) for the production experiments.
+
+**5. Final results**
+
+- **Offline, vs SOTA drafters:** macro-average accepted length improves over EAGLE-3 by 30.9% / 26.7% / 30.0% across the three Qwen3 sizes, while also beating DFlash — i.e., autoregressive-level acceptance at parallel-drafting cost.
+- **Production (DeepSeek-V4 serving):** per-user generation speed up 60–85% at matched throughput versus the deployed MTP-1 baseline, shifting the serving Pareto frontier; under strict latency SLAs (120 tok/s/user on V4-Flash, 50 tok/s/user on V4-Pro) aggregate throughput improves by headline figures of ~661% and ~406%, because the baseline collapses near those operating points while DSpark doesn't. (Caveat: production numbers are DeepSeek's own serving stack, not yet independently reproduced.)
+- 
+---
+
+# Self-Speculative Decoding
+
+# Overview: 
+
 # Paper 9 — LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding (arXiv:2404.16710, Meta — ACL 2024)
 
 
@@ -265,6 +369,8 @@ Self-speculative decoding speedups of up to ~2.16× on summarization (CNN/DM), ~
 **Positioning note:** LayerSkip is the "self-drafting" branch of the speculative-decoding family tree — no separate drafter at all — versus EAGLE's "tiny attached head" branch, which the VLM papers (2–6, 8) all descend from.
 
 ---
+
+# Inspiration Papers
 
 # Paper 10 — Cache-to-Cache**(arXiv:2510.03215, Tsinghua NICS — ICLR 2026)**
 
@@ -313,6 +419,8 @@ On compositional reasoning benchmarks (the CR suite — SugarCrepe-style percept
 **Positioning note:** complements Paper 7's lesson — *what* you distill matters as much as *how*: Draft-OPD fixed the state distribution; CompoDistill fixes the signal (attention, not just logits).
 
 ---
+
+# Token Compression
 
 # Paper 12 — FastVLM**(arXiv:2412.13303, Apple — CVPR 2025)**
 
@@ -370,38 +478,274 @@ SmolVLM-2.2B achieves performance competitive with VLMs many times its size whil
 
 ---
 
-# Paper 14 — DSpark**(DeepSeek, June 2026 — released with the open-source DeepSpec training/eval stack)**
+# Paper 15 — SWIFT: On-the-Fly Self-Speculative Decoding for LLM Inference Acceleration (arXiv:2410.06916, ICLR 2025)
 
 **1. Challenges it's trying to solve**
 
-Two production failure modes of speculative decoding at serving scale:
-
-- **Suffix decay in parallel drafters.** Parallel/block drafters (DFlash/MTP-style) propose a whole block in one forward pass, but each position is predicted without seeing its neighbors — so acceptance probability decays rapidly toward the end of the block. Autoregressive drafters (EAGLE-3) don't decay but pay per-token drafting latency.
-- **Verification waste under high concurrency.** Verifying long fixed-length draft blocks for every request burns batch capacity on tokens that were likely to be rejected anyway. In a busy serving system this degrades throughput badly — baselines hit an "operational cliff" under strict per-user speed SLAs.
+Most speculative decoding methods (EAGLE, Medusa, etc.) need extra parameters and extensive training to build an effective draft model, which restricts applicability — you can't just drop them onto an arbitrary LLM/task combo without a training investment first. Fixed layer-skipping self-speculative methods (like LayerSkip) also need dedicated training of the target itself. SWIFT asks: can a *plug-and-play*, training-free layer-skipping drafter work on off-the-shelf models, adapting per input?
 
 **2. Methods**
 
-- **Semi-autoregressive generation:** a heavy *parallel* drafting backbone coupled with a lightweight *sequential* module (a low-rank "Markov head") that injects intra-block dependencies — later draft tokens get conditioned on earlier ones, mitigating suffix decay at almost no added latency. The best of both drafter families.
-- **Confidence-scheduled verification:** a calibrated confidence head estimates each draft prefix's *survival probability*; combined with engine-specific throughput profiles and live GPU load, the scheduler dynamically tailors the verification length per request — short verification for shaky drafts, long for confident ones, and globally load-aware.
-- **Zero-Overhead Scheduling (ZOS):** the prefix scheduler runs asynchronously, estimating upcoming verification capacity from confidence outputs two steps earlier so the GPU pipeline never stalls waiting for scheduling decisions.
-- **Training-system engineering:** target activations are cached and only pre-LM-head hidden states are communicated (O(d) communication), and *anchor-bounded sequence packing* bundles isolated prediction blocks into dense training batches — decoupling drafter training cost from the target's long contexts.
+Key empirical finding motivating the design: LLMs exhibit **layer sparsity** — many intermediate layers can be skipped with little quality loss — and this sparsity is **task-specific** (the best layers to skip differ by input/task), which argues against a single fixed skip configuration and for **on-the-fly adaptation**. SWIFT splits inference into two phases:
 
-Verification uses standard rejection sampling, so output distribution is provably identical to vanilla decoding (lossless).
+- **Context-based layer set optimization:** before/during generation, SWIFT searches for a good skipped-layer set for the *current* input stream, using **random search combined with interval Bayesian optimization** to propose candidate layer sets efficiently. Crucially, it evaluates candidates using the **target LLM's own already-generated tokens as ground truth** — i.e., it checks retrospectively whether a candidate skip-set would have correctly predicted tokens the (unskipped) target actually produced, allowing **parallel candidate evaluation** without extra forward passes dedicated solely to search.
+- **Confidence-aware inference acceleration:** once a layer set is chosen, it's used to self-draft (skip those layers) and verify with the full model, as in standard self-speculative decoding — with acceptance handled to preserve the output distribution (supports both greedy and full sampling, losslessly).
+- The optimization step is cheap: reported at only ~0.8% of total inference latency, and the maximum optimization iterations / Bayesian interval are tunable to trade search quality for overhead depending on input type.
 
 **3. Loss**
 
-Drafter: distillation-style training as in the EAGLE-3/DFlash lineage — cross-entropy of the semi-autoregressive drafter's predictions against the target model's outputs/hidden-state supervision (with the sequential Markov head trained jointly to model intra-block dependencies). Plus a separate **calibrated confidence objective** for the confidence head, trained so its scores track actual prefix acceptance/survival probabilities (calibration is what makes the scheduler's cost-benefit math valid).
+None — this is a **training-free, inference-time-only** method. No parameters are learned; "optimization" refers to a search procedure over which layers to skip, not gradient-based training. This is SWIFT's central selling point versus EAGLE/LayerSkip/Medusa.
 
 **4. Training data**
 
-Target-model-derived training corpora built through the DeepSpec stack (cached target activations over training text; no human-labeled data needed), applied to open targets — three Qwen3 model sizes (also Gemma supported in DeepSpec) — and to DeepSeek-V4 (V4-Flash / V4-Pro) for the production experiments.
+None required. Evaluated across a range of off-the-shelf models (LLaMA-2/3 series, Yi-34B series, etc.) and downstream tasks with no fine-tuning of the target — the "optimization phase" runs live per input stream, using the model's own generations as its self-supervision.
 
 **5. Final results**
 
-- **Offline, vs SOTA drafters:** macro-average accepted length improves over EAGLE-3 by 30.9% / 26.7% / 30.0% across the three Qwen3 sizes, while also beating DFlash — i.e., autoregressive-level acceptance at parallel-drafting cost.
-- **Production (DeepSeek-V4 serving):** per-user generation speed up 60–85% at matched throughput versus the deployed MTP-1 baseline, shifting the serving Pareto frontier; under strict latency SLAs (120 tok/s/user on V4-Flash, 50 tok/s/user on V4-Pro) aggregate throughput improves by headline figures of ~661% and ~406%, because the baseline collapses near those operating points while DSpark doesn't. (Caveat: production numbers are DeepSeek's own serving stack, not yet independently reproduced.) Everything is MIT-licensed.
+Over 1.6× speedup on average across a wide range of models and tasks while provably preserving the original output distribution (lossless, both greedy and sampled). An observed **scaling law**: speedup and the optimal layer-skip ratio both increase with model size, i.e., larger LLMs have more exploitable layer sparsity (e.g., on Yi-34B with skip ratio r≈0.45, they report acceptance rate α and speedup under greedy FP16 decoding). Optimization overhead is negligible (~0.8% of latency).
+
+**Positioning note:** This is the "no training, no auxiliary model" corner of the self-speculative family — where LayerSkip (Paper 9) pays a training cost to make early layers predictive and Kangaroo adds a small trained adapter, SWIFT pays neither, trading some speedup ceiling for zero setup cost and universal applicability to existing checkpoints.
+
+---
+
+# Paper 16 — CLaSp: In-Context Layer Skip for Self-Speculative Decoding (arXiv:2505.24196)
+
+**1. Challenges it's trying to solve**
+
+Two problems, layered on top of the SWIFT/Self-SD lineage: (a) building compatible draft models for specialized LLMs (no drop-in smaller sibling) remains hard, and existing plug-and-play layer-skip methods (Self-SD, SWIFT) rely on a **costly, largely static, pre-optimized skip-set** (Self-SD: expensive Bayesian optimization over a training corpus to find one fixed set; SWIFT: adapts over the course of many requests but "diminishes when handling sparse or unique task data" — it needs *volume* to adapt well). (b) Neither dynamically adjusts *within* a single generation at the granularity of "what should I skip right now, given exactly what I just generated" — layer importance is context-dependent at a finer grain than either method exploits.
+
+**2. Methods**
+
+- **Per-step dynamic programming for layer selection.** After each verification step, CLaSp uses the **complete hidden states of the last accepted token** (already computed for free during verification) as the ground-truth target, and picks a new skipped-layer set for the *next* drafting round by solving: minimize the cosine distance between the draft model's (skipped) output hidden state and the full model's true hidden state at that position. This is framed as a DP over "which j layers to skip among the first i layers to best approximate the target's hidden-state trajectory," with an approximate transition (not exactly Markov, but empirically close, verified against brute-force search).
+- **Sparse Persistence exploitation:** adjacent tokens need highly similar skip sets (Jaccard similarity high locally, decaying with distance) — so instead of recomputing the DP after every single token, CLaSp updates only every few verification steps (a tunable Layer Optimization Interval), trading a small τ reduction for much lower overhead.
+- **Sequence-parallel DP implementation:** the DP's O(L·M) double loop is restructured so states at the same "layer index i" but different skip-counts j are computed independently and packed via a custom attention mask (reusing the same KV-cache, no duplication) — cutting DP wall-clock from ~2.5s to ~0.14s on LLaMA3-70B, comparable to a single verification step.
+- Standard speculative sampling (lossless) is used for accept/reject, exactly as in prior self-SD work.
+
+**3. Loss**
+
+None — training-free, same as SWIFT. The "objective" being minimized is the DP's cosine-similarity criterion at inference time, not a trained parameter. No gradient-based training occurs anywhere.
+
+**4. Training data**
+
+None required. Evaluated directly on off-the-shelf LLaMA2/LLaMA3 checkpoints (8B, 13B, 70B, 70B-Chat, and 405B via INT8 quantization) across Spec-Bench's six tasks (MT-bench, WMT14, CNN/DM, Natural Questions, GSM8K, DPR).
+
+**5. Final results**
+
+Consistent **1.3×–1.7×** wallclock speedup over vanilla autoregressive decoding, losslessly, and **outperforms both Self-SD and SWIFT** head-to-head on the same hardware/benchmark (e.g., LLaMA3-70B greedy overall: Self-SD 1.47×, SWIFT 1.28×, CLaSp 1.67×). Skipping ~50–60% of layers is the sweet spot. A clear scaling law: bigger models benefit more (LLaMA3-8B → 1.24× vs. LLaMA3.1-405B → 1.73× on MT-bench), consistent with SWIFT's finding that larger models have more exploitable layer redundancy. DP optimization overhead is negligible after the parallel implementation (~4.8% of latency, further reduced by lowering update frequency).
+
+**Positioning note:** CLaSp sits directly between SWIFT and LayerSkip in the design space — training-free like SWIFT, but re-optimizing per *token* (using the hidden-state signal from verification.
+
+---
+
+# Paper 17 — CAS-Spec: Cascade Adaptive Self-Speculative Decoding for On-the-Fly Lossless Inference Acceleration of LLMs (arXiv:2510.26843, NeurIPS 2025)
+
+**1. Challenges it's trying to solve**
+
+Two separate lines of work each hit a ceiling: on-the-fly self-speculative methods (SWIFT, CLaSp) are training-free and universally applicable, but fall short of the speed gains achieved by trained methods — a single self-drafting stage has limited headroom. **Cascade speculative decoding** (chaining multiple draft models of increasing size/quality before the target verifies) promises more acceleration by inserting several drafting stages instead of one, but classic cascades require **training multiple distinct draft models**, which is prohibitively costly and has limited real-world adoption. Additionally, the standard cascade coordination algorithms (vertical/horizontal cascades, static trees) are designed for *independent trained* draft models and are inefficient/inappropriate when the "draft models" are just configurations of the same self-speculative target.
+
+**2. Methods**
+
+- **Dynamically Switchable Inference Acceleration (DSIA):** rather than training separate draft models, CAS-Spec builds a **hierarchy of draft stages entirely out of the target model itself**, using training-free acceleration knobs that can be toggled per stage — specifically **layer sparsity** (skipping layers, à la Self-SD/SWIFT/CLaSp) and **activation quantization** — stacking multiple such configurations (e.g., aggressive skip+quantize for the cheapest/fastest stage, milder configs for intermediate stages, full model as final verifier) into a multi-level cascade, all embedded in one model's inference process.
+- **Dynamic Tree Cascade (DyTC):** because static vertical/horizontal cascade routing doesn't fit this setting well, CAS-Spec introduces an adaptive router that, at runtime, (a) decides which draft stage(s) to route through, (b) constructs the draft tree shape, and (c) controls per-stage draft lengths — driven by heuristics based on **observed token acceptance rates** and **predicted latency** per stage, aiming to maximize throughput rather than follow a fixed schedule.
+- Verification remains standard rejection sampling against the full target, preserving losslessness.
+
+**3. Loss**
+
+None — training-free, consistent with the self-speculative lineage (SWIFT, CLaSp). DSIA configurations (which layers to skip, which activations to quantize, at what precision) are selected/tuned via runtime heuristics, not gradient-based training. The "adaptivity" is in the routing algorithm (DyTC), not in learned model parameters.
+
+**4. Training data**
+
+None required for the core method. Evaluated across "various LLMs and datasets" (per the abstract/poster) directly on off-the-shelf checkpoints, following the same evaluation philosophy as SWIFT/CLaSp (Spec-Bench-style multi-task benchmarking).
+
+**5. Final results**
+
+State-of-the-art acceleration among on-the-fly (training-free) speculative decoding methods: average speedup **1.1×–2.3×** over autoregressive decoding across LLMs and datasets — a higher ceiling than single-stage self-SD methods like SWIFT/CLaSp (1.1–1.7× range), attributable to the cascade's multiple drafting stages. The DyTC routing algorithm itself contributes substantially: **+47% average speedup over a cascade baseline** and **+48% over a tree-based baseline**, showing the adaptive routing (not just the cascade structure) is a major source of the gain.
+
+**Positioning note:** CAS-Spec is the "cascade" extension of the SWIFT/CLaSp lineage — instead of picking *one* skip configuration per step (CLaSp) or per request-stream (SWIFT), it maintains a *hierarchy* of configurations and routes dynamically among them, borrowing the "multiple draft models of increasing capability" idea from trained cascade SD but making every stage free (no training) by reusing DSIA knobs on the same target.
+
+---
+
+# Paper 18 — LEAP: Zone-Aware MCTS for LLM Self-Speculative Decoding (ICML 2026)
+
+**1. Challenges it's trying to solve**
+
+Self-speculative decoding's central open problem is **layer configuration strategy** — which subset of the target's layers to use as the draft model. Prior approaches attack this with dynamic programming approximations (CLaSp), Bayesian optimization (Self-SD, SWIFT), or dynamically switchable knobs (CAS-Spec) — all heuristic, greedy, or approximate. LEAP's framing: layer selection is fundamentally a **sequential decision-making problem** (choosing a subset from a huge combinatorial space, e.g., 2^L configurations for L layers), which is exactly the kind of problem Monte Carlo Tree Search is built for — but naively applying MCTS to deep LLMs faces a **prohibitively large search space**.
+
+**2. Methods**
+
+- **MCTS formulation:** frame layer-subset selection as a sequential decision process (include/exclude each layer, or each layer-group, one decision at a time) and search it with MCTS rather than DP approximations or Bayesian optimization — in principle allowing better exploration of good configurations than greedy/local methods.
+- **Two structural observations to tame the search space:**
+  1. **Prefill-derived redundancy transfers to decoding** — redundancy information computed cheaply during the prompt's prefill pass (which layers are "safe" to skip) remains informative for the subsequent decoding steps, so the expensive redundancy analysis doesn't need to be redone at every token (unlike CLaSp, which re-optimizes per verification step).
+  2. **Zone-wise layer redundancy** — layer importance/redundancy isn't uniformly distributed across depth; it clusters into "zones" (contiguous regions of the network with similar redundancy characteristics).
+- **Structured search space via zone partitioning + layer grouping:** using observation (2), LEAP partitions the network into zones and groups layers within each zone, turning the raw 2^L configuration space into a much smaller structured space — this grouping is the **inductive bias** that makes MCTS tractable over deep LLMs, since the search now operates over zone/group-level decisions rather than individual layers.
+- Plug-and-play: no target retraining, applied directly to existing checkpoints (consistent with the SWIFT/CLaSp/CAS-Spec training-free lineage).
+
+**3. Loss**
+
+None — training-free. MCTS search uses a reward signal (presumably acceptance length or output-fidelity proxy, analogous to CLaSp's cosine-similarity criterion or SWIFT's acceptance-rate objective) to evaluate candidate configurations, but this is a search/planning objective, not a gradient-trained loss.
+
+**4. Training data**
+
+None required for the core method; the prefill-derived redundancy signal is computed from the prompt itself at inference time, not from an offline training set.
+
+**5. Final results**
+
+Speedup of **1.7×–2.0×** for LLM inference — ahead of SWIFT (up to ~1.6×) and comparable to or exceeding CLaSp's best-case numbers (~1.3–1.7×), positioning LEAP as (per its own framing) a stronger search strategy within the same training-free, plug-and-play self-speculative decoding family.
+
+**Positioning note:** LEAP is the natural next point along the SWIFT → CLaSp → CAS-Spec → LEAP progression: each paper keeps the "no training, use the target's own layers" premise fixed and improves the **search/optimization strategy** for deciding what to skip — heuristic search (SWIFT) → DP approximation using verification feedback (CLaSp) → multi-stage cascades with adaptive routing (CAS-Spec) → structured MCTS with a zone-based inductive bias (LEAP). Notably, LEAP's "zone-wise redundancy" finding is close in spirit to your idea 2.1 (prune by criterion rather than arbitrarily) — but LEAP treats zones as a *search-space prior* rather than a pruning/distillation target, so combining LEAP's zone structure with actual weight pruning + healing (rather than pure inference-time skipping) remains open.
+
+---
+
+# Paper 19 — Vegas# Paper 19 — Vegas (a.k.a. SpecAttn): Self-Speculative Decoding with Verification-Guided Sparse Attention (arXiv:2602.07223 / ICML 2026 poster)
+
+*(Note: the ICML poster is titled "Vegas," but its abstract is word-for-word identical to arXiv:2602.07223's "SpecAttn: Co-Designing Sparse Attention with Self-Speculative Decoding" — almost certainly the same paper under a renamed poster title. Treating as one paper.)*
+
+**1. Challenges it's trying to solve**
+
+Long-context LLM inference is severely bottlenecked by KV-cache memory demands. Prior work showed that **sparse-attention self-speculative decoding** — drafting with only a *subset* of the KV cache, then verifying with the *full* KV cache — gives lossless speedups, since a small fraction of KV entries (often ~5%) dominates attention output. But existing sparse-attention drafters rely on **standalone KV-selection algorithms** (e.g., a separate importance-scoring heuristic) to decide which entries to keep for drafting — and this **overlooks that the criticality of every KV entry is already computed, for free, during verification's full-attention pass.** Treating drafting and verification as independent stages wastes that signal.
+
+**2. Methods**
+
+**Co-design drafting and verification around a shared signal:**
+
+- During the **verification** phase (which runs full attention over all KV entries to check draft tokens), the attention weights/logits computed there directly reveal the **exact criticality of every KV entry** — a "free oracle," since this computation happens anyway and previously its byproduct information was thrown away.
+- Vegas/SpecAttn captures this: it identifies the critical KV entries **as a byproduct of verification**, and then uses exactly these entries as the sparse KV subset for the **next drafting phase** (rather than an independent, standalone selection heuristic).
+- This closes the loop between the two phases: verification not only produces accept/reject decisions but also *tells the drafter which cache entries matter next*, improving draft-token acceptance rate while adding minimal overhead (no separate KV-scoring pass is needed — it's a byproduct, not new computation).
+
+**3. Loss**
+
+None — training-free, purely an inference-time mechanism (KV-entry selection based on attention weights already computed during verification). No model parameters are trained; the "criticality" signal is a direct read-off of existing attention computation.
+
+**4. Training data**
+
+None required. Applied directly to existing long-context LLM checkpoints; evaluated in a long-context inference setting where KV-cache size is the bottleneck (batch inference / long sequence generation).
+
+**5. Final results**
+
+Per the abstract's framing: improves draft token acceptance rate versus prior sparse-attention self-speculative baselines (which used standalone, verification-blind KV selection) while incurring **low KV-selection overhead**, thereby improving overall decoding throughput. (Exact numeric speedup/τ figures aren't in the fetched abstract text — happy to dig further into the PDF body if you want precise numbers.)
+
+**Positioning note:** Vegas/SpecAttn attacks a different axis of self-speculative decoding than SWIFT/CLaSp/CAS-Spec/LEAP — those methods sparsify *layers* (which of the target's depth to use); this paper sparsifies *KV cache/attention* (which of the target's context to attend to), for long-context settings specifically. The two axes (layer sparsity vs. attention/KV sparsity) are orthogonal and, per CAS-Spec's own DSIA framing (which already lists "layer sparsity and activation quantization" as swappable knobs), a natural extension would add "verification-guided KV sparsity" as a third DSIA strategy in a cascade.
+
+---
+
+# Paper 20 — FastVLM (self-speculative decoding for VLMs)# Paper 20 — FastVLM: Self-Speculative Decoding for Fast Vision-Language Model Inference (arXiv:2510.22641, IIT Bombay — IJCNLP-AACL 2025)
+
+*(Important: this is a different paper from Apple's "FastVLM: Efficient Vision Encoding for Vision Language Models" — Paper 12 in our list. Pure name collision; different authors, different problem, different method. I'll call this one "FastVLM-SSD" to avoid confusion going forward if needed.)*
+
+**1. Challenges it's trying to solve**
+
+VLMs suffer high computational cost and inference latency because their decoder (typically an LLM) generates tokens autoregressively, one at a time. The paper targets this specifically through **self-speculative decoding for VLMs** — using part of the VLM's own decoder as the draft, rather than an external drafter — but wants to do better than naive early-exit by giving the draft component genuine access to "deeper" representational knowledge from the full model, not just whatever an early layer happens to compute.
+
+**2. Methods**
+
+A VLM has an encoder (producing multimodal features z = E(I, T₀) from image I and prompt T₀) and a decoder LLM. FastVLM-SSD's draft model is built from an **intermediate decoder layer (the n-th layer)** plus a novel **imitation network (IN)**:
+
+- **Imitation network:** rather than applying the LM head directly to the n-th layer's hidden state (as plain early-exit does), the IN takes the n-th layer's representation and is trained to **mimic the hidden representations of deeper layers** (specifically fusing insights from the last few layers, e.g., L−3 onward — following prior findings that fusing the last ~3 layers' representations works best). This decouples the draft model's task from the final layer's exact behavior, letting a shallow exit still approximate deep-layer knowledge.
+- **Training procedure (imitation learning):** the IN's output is passed through the (shared) LM head; training combines **cosine-similarity loss** (matching deeper hidden representations), **knowledge distillation**, and **cross-entropy loss** — the IN learns to produce a representation that "looks like" what a much deeper layer would have produced.
+- **Inference:** the n-th decoder layer + IN generate draft tokens autoregressively; the full decoder verifies them non-autoregressively (standard self-speculative verification). Accepted tokens proceed; rejected tokens are corrected by the full model, and this correction signal also **guides further refinement of the draft model** (an online feedback loop between rejection and drafter improvement).
+- Crucially, the full model's own weights/performance are preserved throughout — only the lightweight IN is trained, layered onto a frozen decoder-layer subset.
+
+**3. Loss**
+
+A **combined loss**: cosine-similarity loss (IN's output vs. deeper-layer hidden representations) + knowledge distillation loss (matching the full model's output distribution) + standard cross-entropy loss (next-token prediction). This is a genuine trained-component method (unlike SWIFT/CLaSp/LEAP/Vegas, which are training-free) — closer in spirit to LayerSkip/Kangaroo's "train intermediate layers to be predictive," but via an added lightweight network rather than modifying the base layers' training.
+
+**4. Training data**
+
+Standard VLM training/fine-tuning corpora appropriate to the evaluated tasks — image captioning and VQA-style datasets (evaluated on COCO, NoCaps, VisDial per the tables), used to fine-tune the IN (and lightly adapt the backbone) while keeping the full model's core performance intact.
+
+**5. Final results**
+
+Reported speedup of **1.55×–1.85×** over standard autoregressive VLM decoding (per ACL Anthology abstract), while maintaining output quality close to the full model, evaluated on COCO (captioning), NoCaps (zero-shot captioning), and VisDial (dialogue) benchmarks.
+
+**Positioning note:** this is the VLM-specific, *trained* branch of the self-speculative family — contrast with LayerSkip/Kangaroo (LLM-only, train the base model itself) and SWIFT/CLaSp/CAS-Spec/LEAP/Vegas (LLM-only, training-free). FastVLM-SSD sits at the intersection your idea 2.6 (visual grounding for the drafter) and self-speculative decoding (no separate drafter model) — its imitation network is conceptually similar to DREAM's cross-attention-to-intermediate-features (Paper 5), but applied within a single shared model rather than between two separate models.
+
+---
+
+# Paper 21 — Aletheia# Paper 21 — Aletheia: Gradient-Guided Layer Selection for Efficient LoRA Fine-Tuning Across Architectures (arXiv:2604.15351)
+
+*(Note: this paper is about training-time parameter-efficient fine-tuning, not inference-time speculative decoding — a different problem area from Papers 1–20. Flagging clearly since it's a genuine shift in topic.)*
+
+**1. Challenges it's trying to solve**
+
+Standard LoRA practice applies adapters **uniformly to every transformer layer**, regardless of whether that layer is actually relevant to the downstream task. This wastes compute/memory on adapter parameters and forward/backward passes through layers that contribute little to task adaptation. The question: can task-relevant layers be identified cheaply, so LoRA is applied only where it matters?
+
+**2. Methods**
+
+- **Lightweight gradient probe:** run just **5 forward-backward passes** on task data (no adapters yet) and measure **per-layer gradient norms** as a proxy for task relevance — layers with larger gradient signal are presumed more important for adapting to this task.
+- **Selective LoRA application with asymmetric rank allocation:** apply LoRA adapters **only to the selected (high-gradient) layers**, skipping low-gradient layers entirely (eliminating their adapter forward/backward compute), with rank allocated asymmetrically across the chosen layers rather than a uniform fixed rank everywhere.
+- Key empirical observation supporting the design: for many downstream tasks, **roughly half the layers behave as "pass-through" blocks** that minimally transform their input — precisely the layers gradient-probing identifies as low-relevance and skips.
+
+**3. Loss**
+
+Standard LoRA fine-tuning objective (task cross-entropy / instruction-tuning loss) applied only through the selected layers' adapters; the gradient-probe step itself uses the same task loss's gradients purely as a diagnostic signal (5 batches, no adapter training yet) before committing to a layer subset.
+
+**4. Training data**
+
+Instruction-following fine-tuning data (a single task domain across the paper — the authors flag this as a limitation) applied to 14 successful models across 8 architecture families spanning 0.5B–72B parameters, including dense and Mixture-of-Experts models (e.g., Mixtral 8x variants); evaluated for downstream behavior on MMLU, GSM8K, and HumanEval.
+
+**5. Final results**
+
+**15–28% training speedup** (mean 23.1%, statistically significant p<0.001) across 81 experiment rows, with a **100% per-model speed win rate** in the main campaign, and "bounded extra forgetting" / broadly matched downstream behavior on MMLU/GSM8K/HumanEval versus standard full-layer LoRA. The speedup comes specifically from eliminating adapter forward/backward computation in skipped layers (the frozen base model still processes all tokens through all layers — only adapter overhead is removed). A compute-matched follow-up analysis (Campaign 2) found the speed savings don't clearly translate into a downstream-quality advantage at matched compute — i.e., the win is efficiency, not accuracy. One documented failure case: Pythia/GPT-NeoX had fp16 instability affecting both Aletheia and standard LoRA (an architecture-specific issue, not a method failure).
+
+**Positioning note:** this is a **training-time analog of your idea 2.1** — Aletheia identifies task-relevant layers via gradient-norm probing for *where to add adapters*, whereas your idea uses agreement/acceptance signal to decide *which layers to keep in a drafter*. Same underlying question (which layers matter, cheaply diagnosed), different downstream use (parameter-efficient fine-tuning vs. speculative-decoding draft construction). Their finding that "~half the layers are pass-through" for typical downstream tasks is a useful empirical prior if you want to bound your own search space before applying an acceptance-length criterion.
+
+---
+
+# Paper 22 — GradPruner# Paper 22 — GradPruner: Gradient-Guided Layer Pruning Enabling Efficient Fine-Tuning and Inference for LLMs (arXiv:2601.19503)
+
+**1. Challenges it's trying to solve**
+
+Structured pruning methods speed up **inference** but typically require extra time/memory for training, knowledge distillation, or structure search on top of already-expensive fine-tuning — so you pay a training-cost tax to get an inference-cost win. GradPruner asks: can pruning be derived essentially **for free**, as a byproduct of the fine-tuning process you're already running, so both training *and* inference get faster simultaneously — with no separate pruning stage?
+
+**2. Methods**
+
+- **Initial Gradient Information Accumulation (IGIA) Matrix:** during the **early stage of LoRA fine-tuning** (before pruning), accumulate per-parameter gradients over some initial steps to build the IGIA-Matrix, which scores each layer's importance for the specific downstream task — layers with small cumulative gradient contribute little to the task and are pruning candidates.
+- **Sparsify + merge, not just delete:** rather than crudely dropping the identified low-importance layers, GradPruner **sparsifies** them based on the IGIA-Matrix (keeping only the elements that matter) and then **merges** these sparsified remnants into the remaining layers — specifically only combining elements that share the same sign, which is a lightweight, training-free way to fold residual signal from pruned layers into kept layers rather than discarding it outright. This lets more layers be pruned than a naive "just delete the unimportant ones" approach would tolerate, since some of their contribution is preserved via merging.
+- Result: a smaller, merged model is produced directly from the byproduct of the fine-tuning run already underway, without an added distillation phase, knowledge-distillation loss, or dedicated structure search.
+
+**3. Loss**
+
+The **underlying fine-tuning loss stays exactly whatever it already was** (standard LoRA cross-entropy fine-tuning on the downstream task) — GradPruner adds no new loss term. Its contribution is entirely in how the **existing gradients**, already computed as a normal part of training, are accumulated (IGIA-Matrix) and used post-hoc to prune and merge, not in any new training objective.
+
+**4. Training data**
+
+Downstream fine-tuning datasets — evaluated on **two LLMs and eight downstream datasets** (their comparisons involve models like Llama3.1-8B and Llama3.2-3B). The IGIA-Matrix is computed from the gradients naturally produced during that same fine-tuning run — no separate calibration or distillation corpus is required.
+
+**5. Final results**
+
+**40% parameter reduction with only a 0.99% accuracy decrease** on downstream tasks — outperforming compared structured-pruning baselines (APT, SAT, LLM-Pruner-style gradient-based structural pruning, LaCo layer-merging, and others) across the two-model/eight-dataset evaluation. Notably, some pruned models (e.g., pruned Llama3.1-8B) **outperform directly fine-tuned versions of Llama3.2-3B** — i.e., the pruned-and-merged larger model beats a smaller model fine-tuned from scratch on the same task, suggesting the merging step retains genuinely useful capacity rather than just discarding it.
+
+**Positioning note:** GradPruner is the closest published precedent to your idea 2.1 (Acceptance-Guided Layer Shearing) among everything we've covered — it prunes layers using a gradient-based importance signal computed *during* an existing training process, then **merges** (rather than discards) pruned-layer information into survivors. The two open gaps relative to your idea: (a) GradPruner's criterion is task-loss gradient magnitude, not speculative-decoding acceptance length, and (b) it isn't evaluated for inference-time draft/target agreement at all — it's a general efficient-fine-tuning method, not built for the drafter-construction setting. Your contribution would be porting this gradient-guided-prune-and-merge recipe to the acceptance-length objective specifically, which nothing in your list does yet.
 
 
+# Paper 23 — Kangaroo: Lossless Self-Speculative Decoding via Double Early Exiting (arXiv:2404.18911, NeurIPS 2024, Huawei Noah's Ark)
+
+**1. Challenges it's trying to solve**
+
+Speculative decoding accelerates LLM inference losslessly, but training a separate draft model to reach a satisfactory acceptance rate is costly. Self-speculative approaches (like fixed early-exit — LayerSkip) avoid a second model, but they surface a subtler problem: once you skip most of the depth, **the shallow sub-network's own inference latency stops being negligible** relative to the target — every drafted token still costs a real forward pass through the shallow part, and if the shallow network is weak, you spend a lot of steps drafting tokens that get rejected anyway. So the real challenge becomes: how do you raise acceptance rate *while also* minimizing the number of costly drafting steps the shallow model has to take, especially on hard tokens where it's likely to be wrong regardless?
+
+**2. Methods**
+
+**Double early exiting** — two separate exit mechanisms working together:
+
+- **Exit #1 (architectural / "which sub-network is the drafter"):** a **fixed shallow sub-network** (the first few layers of the target) serves as the self-draft model, with the rest of the target's layers serving as the verifier — same basic self-speculative structure as LayerSkip. But instead of relying on the raw shallow layers' hidden state directly, Kangaroo adds a **lightweight trained adapter module** on top of the sub-network to bridge the representational gap between the shallow sub-network and the full model — the adapter is just **one multi-head attention layer + two normalization layers**, deliberately minimal. Training follows the Medusa/EAGLE-style recipe (train the adapter against target model's outputs), but critically the shallow *base* layers themselves are frozen/untouched — only this small adapter is trained. Because draft and target share the same early layers, they also **share KV-cache and computation** for that shared prefix — the only extra deployment cost is the tiny adapter.
+- **Exit #2 (dynamic, at the token level, during drafting):** to avoid wasting compute on tokens the shallow model is unlikely to get right, Kangaroo **halts the small model's further autoregressive drafting mid-step** whenever its confidence for the current token drops below a threshold — i.e., it stops drafting further tokens in this round rather than pushing on through a token it's unsure about. This second exit applies in both single-sequence and tree-decoding verification settings, trimming wasted drafting steps on hard tokens specifically.
+
+**3. Loss**
+
+Adapter-only training loss following the Medusa/EAGLE training recipe: cross-entropy against the target model's token distribution (the shallow sub-network + adapter learn to approximate what the full target would predict). The frozen shallow layers are untouched — this is architecturally closer to EAGLE (small trained module bridging to a frozen backbone) than to LayerSkip (which retrains the base model's layers with dropout + multi-depth loss).
+
+**4. Training data**
+
+Following EAGLE/Medusa-style training data practice — instruction/dialogue data used to train only the small adapter (67M parameters, vs. Medusa-1's 591M) — the base target LLM stays entirely frozen throughout.
+
+**5. Final results**
+
+Under single-sequence verification, up to **1.68×** speedup on Spec-Bench; with tree-based decoding, walltime speedups up to **2.04×**, both while **outperforming Medusa-1 with 88.7% fewer additional parameters** (67M vs 591M) — a strong parameter-efficiency result, since the "drafter" is mostly free (shared shallow layers + shared KV-cache), with only a tiny adapter as genuinely new capacity. The paper explicitly notes that raw compression rate (how few layers/params you use) doesn't reliably predict acceptance rate — the confidence-based second exit is what actually controls the useful trade-off between drafting cost and acceptance.
+
+**Positioning note:** Kangaroo is the missing link between LayerSkip (Paper 9) and the SWIFT/CLaSp/CAS-Spec/LEAP lineage (Papers 15–18) — architecturally it's LayerSkip's shared-prefix idea (draft = fixed shallow layers of the target, full cache sharing), but instead of retraining the base model with layer dropout, it adds a **tiny trained adapter** (EAGLE-style) on top of the frozen shallow layers, and instead of a fixed drafting length, it adds a **confidence-based early stop within the draft phase itself** — the "double" exit. This is directly relevant to your idea 2.1: Kangaroo shows that a frozen shallow prefix + small trained bridge can beat far larger dedicated draft models, which supports top-truncated shearing (rather than scattered pruning) as the more practical starting point, since it gets KV-cache sharing for free exactly as Kangaroo does.
+
+Want me to fold this into the running comparison table alongside the other 22, or keep going if more papers are coming?
 
 
 
