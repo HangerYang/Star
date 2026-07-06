@@ -4,69 +4,57 @@
 
 # Overview
 
-# Speculative Decoding: Training & Inference Overview (broader view)
+# Standard Speculative Decoding: The Pipeline
 
+**Setup:**
+1. **Target prefill** — the target processes the full prompt, producing its KV-cache and the first token.
 
-## The core idea (Leviathan et al. 2023 / Chen et al. 2023, "Accelerating LLM Decoding with Speculative Sampling")
+**Loop (repeats each round):**
+2. **Draft prefill/context sync** — the drafter (a genuinely separate model — EAGLE's small head, Medusa's extra heads, MASSV's small sibling LM) builds up its own context. First round: full prefill of the prompt in its own cache. Later rounds: append newly accepted tokens.
+3. **Draft** — the drafter proposes k tokens, either sequentially (EAGLE: one small transformer layer autoregressively predicting the next *feature*, then the target's frozen LM head turns it into a token) or in parallel (Medusa: multiple independent heads guessing several future positions at once).
+4. **Verify** — the target runs one forward pass over all k drafted tokens (via tree or chain attention), producing its own distribution at each position.
+5. **Accept/reject** — rejection sampling: accept the matching prefix, resample a correction token at the first divergence. Lossless.
+6. **Cache update** — advance target cache (native) and drafter cache (its own, separate structure) to the accepted length; loop.
 
-A cheap draft model proposes tokens; the expensive target model verifies them in one parallel pass; rejection sampling guarantees the final output distribution matches what the target would have produced alone. This dual-model formulation is the ancestor of nearly everything below.
-
-## Training-side taxonomy (how the draft signal is obtained)
-
-- **Independent draft model** — a genuinely separate, smaller LM (often same family, sometimes distilled specifically for this job: DistillSpec trains the drafter to match the target's *output distribution* directly rather than ground truth, using the target's own samples). Pro: fully decoupled, drop-in. Con: alignment is never perfect; tokenizer/vocab must match the target exactly.
-- **Attached head, no full model** — **Medusa** adds multiple parallel decoding heads on top of the *frozen* target's last hidden state, each head predicting a different future position independently, then verifies with a tree; **EAGLE** instead adds one autoregressive feature-predicting layer (sequential, not parallel heads) — the distinction between "parallel heads" (Medusa, Hydra, Recurrent Drafter) and "sequential feature autoregression" (EAGLE) is itself a major taxonomic split, with sequential methods generally reaching higher acceptance length because they preserve inter-token dependency, while parallel-head methods are cheaper per step but suffer the same "suffix decay" problem raised later in production systems.
-- **Retrieval / non-parametric drafting, no training at all** — **Prompt Lookahead Decoding (PLD)** and **REST** skip training entirely: draft tokens are pulled from n-gram matches in the prompt/context (PLD) or retrieved from a datastore of past generations (REST). Pro: zero training cost, works instantly on any target. Con: only helps when the output has textual overlap with available context (great for RAG/code-editing tasks with heavy copying, weak for open-ended novel generation).
-- **Parallel decoding without a separate drafter, via masking** — **Lookahead Decoding** (Fu et al. 2024) generates and verifies n-grams using Jacobi-iteration-style parallel guesses, no draft model or extra training required, trading some speedup for zero additional parameters.
-- **Self-drafting** — covered below as its own section.
-
-## Inference-side taxonomy (how drafts are structured/verified)
-
-- **Chain drafting** — one linear sequence of k draft tokens, verified once (original formulation).
-- **Tree drafting** — multiple candidate continuations verified simultaneously in a single batched forward pass via a tree-structured attention mask (**SpecInfer** pioneered tree-based speculative inference and verification at the systems level; **EAGLE-2** made the tree *dynamic*, i.e. its shape adapts to per-step confidence rather than a fixed shape; **OPT-Tree** learns/searches the optimal tree structure per model pair). Pro: much higher expected accepted length per target pass than a chain of the same token budget. Con: verification cost and complexity grow with tree width; naively wide trees waste target compute on low-probability branches.
-- **Batch-aware verification** — in production serving (not just single-request benchmarks), draft token count interacts badly with batch size: verifying long per-request trees at high concurrency starves batch capacity (this is a recognized failure mode across multiple 2024–2026 systems papers, addressed by adaptive/dynamic speculation lookahead and load-aware schedulers).
-
-## General pros (across the whole paradigm)
-
-- **Losslessness** — when verification uses proper rejection sampling, the marginal output distribution is provably identical to the target alone; this is what separates speculative decoding from early-exit or distillation approaches that *do* change outputs.
-- **Wall-clock, not FLOPs** — the win exploits the fact that LLM decoding is memory-bandwidth-bound, not compute-bound; verifying k tokens in parallel costs barely more than verifying one, so "wasted" compute on rejected drafts is nearly free relative to latency.
-- **Stacks with everything else** — quantization, KV-cache compression, continuous batching, and speculative decoding are largely orthogonal and combine.
-
-## General cons (across the whole paradigm)
-
-- **Heterogeneous gains** — speedup is highly task- and content-dependent: high on repetitive/predictable text (code, structured output, retrieval-heavy answers), low on creative or high-entropy generation. Benchmarks like **Spec-Bench** were built specifically because early papers reported speedups under wildly inconsistent conditions, making cross-paper comparison unreliable.
-- **Systems complexity compounds with scale** — the single-request speedup story (batch size 1, one GPU) frequently doesn't survive contact with production serving: batching, scheduling, and memory pressure interact with drafting in ways that erode or invert the benefit unless specifically engineered for (a recurring theme across systems-focused papers).
-- **No free lunch on drafter cost** — every drafting scheme pays *something* (extra parameters, extra forward passes, retrieval lookups, or masked-parallel-decode overhead); the entire research area is fundamentally about minimizing that something relative to the τ (accepted length) it buys.
+Two full sets of weights and two KV-caches exist throughout. The core efficiency lever is **τ (accepted length) vs. c (drafter cost relative to target)** — speedup ≈ τ/(1+k·c).
 
 ---
 
-# Self-Speculative Decoding
+# Self-Speculative Decoding (SSD): The Pipeline
 
-## The general framework
+**Setup:**
+1. **Target prefill** — same target, but only *one* set of weights exists. Prefill runs the full model once, populating one shared KV-cache for all layers 1…L.
 
-The target model drafts for itself, with no separate model:
+**Loop:**
+2. **Draft pass** — run only the first E layers (fixed as in LayerSkip/Kangaroo, or dynamically chosen per-input as in SWIFT/CLaSp/LEAP/CAS-Spec) and apply the model's own LM head (or a tiny adapter, as in Kangaroo) early. No separate prefill step is needed — the drafter's "context" *is* the target's own cache up to layer E, already populated.
+3. **Draft** — generate k tokens using only layers 1…E, reusing the same cache the eventual verification will also use.
+4. **Verify** — run the *remaining* layers E+1…L over the k drafted tokens, reusing the layers-1…E computation and cache already done in step 2 (not recomputed).
+5. **Accept/reject** — same rejection sampling, lossless.
+6. **Cache update** — one cache, already correctly positioned; loop, possibly re-selecting E (SWIFT/CLaSp/LEAP re-optimize which layers to skip at this point).
 
-- **Layer-skipping** (LayerSkip; also the original "self-speculative decoding" framing by Zhang et al. 2023, and **Draft & Verify**, ACL 2024): draft by exiting early at layer E (skip the rest), then verify by running the remaining layers on the drafted tokens, reusing the early layers' KV-cache/activations across both passes.
-- **Adaptive/learned exit selection** (**Kangaroo**, "double early exiting"): rather than a single fixed exit layer trained in from scratch, Kangaroo adds a lightweight adapter after an early layer and learns *when* to trust the early-exit prediction vs. fall through to full depth — a second early-exit decision at the token level, not just the model level.
-- **Retrieval/mask-based self-drafting** (PLD, REST, Lookahead Decoding): arguably also "self-speculative" in spirit — no auxiliary trained model, the base model (or the raw prompt/datastore) supplies drafts.
-- **Sparse/structured self-drafting** (**SWIFT**): dynamically chooses which layers to skip per input on the fly rather than fixing E at training time, aiming to avoid retraining the target at all.
-
-## Pros
-
-- **Zero extra parameters / single checkpoint** — nothing to host besides the target; deployment stays simple (no separate drafter lifecycle, no tokenizer-matching risk).
-- **Perfect cache sharing by construction** — layers before the exit point are computed once and reused for both draft and verify; there's no cross-model alignment problem to solve at all, unlike independent-drafter methods where feature/KV mismatch is a constant engineering battle.
-- **No drafter drift risk** — since draft and target share weights, there's no separate model that can fall out of sync as the target is fine-tuned/updated (a real operational cost for two-model setups in production).
-- **Some variants need no retraining at all** — SWIFT-style layer-skipping and PLD/REST/Lookahead-Decoding self-drafting can be applied to an off-the-shelf checkpoint with no training investment, trading some speedup for zero setup cost.
-
-## Cons
-
-- **Trained variants require modifying the target itself** — LayerSkip-style approaches need layer dropout + early-exit loss baked into (re)training; this is a heavier, riskier intervention than bolting on a small external head, and it's not something you can apply to a model you don't control the training pipeline for.
-- **Lower speedup ceiling in practice** — reported gains for early-exit/self-speculative methods (roughly 1.4–2.3× across the survey's tabulated results) generally trail the best independent-drafter tree methods (EAGLE-family: ~2.9–3.6×+), because early layers of a shared model are a compromise representation, not a specialist trained purely to predict.
-- **Exit-point rigidity** — the skip depth is largely a training-time or heuristic choice; adapting it per-input (Kangaroo, SWIFT) helps but adds its own overhead (an adapter/gating decision at every step) and complexity.
-- **Harder to decouple engineering from modeling** — because draft and verify share the same weights and cache, changes to improve one (e.g., widening the tree, extending draft length) interact directly with the target's own serving path, unlike a separate drafter that can be iterated on independently.
+One set of weights, one KV-cache, zero redundant prefill — the structural difference from standard SD that matters most.
 
 ---
 
-**The one-line contrast:** independent-drafter methods buy higher acceptance length by specializing a dedicated (possibly trained-from-scratch-feeling) component, at the cost of a second model to align and maintain; self-speculative methods buy architectural simplicity and free cache sharing by drafting from a compromise position inside the target itself, at the cost of a lower speedup ceiling and (for trained variants) having to modify the target's own training.
+# Self-Drafting vs. EAGLE-based: Pros and Cons
+
+| | **Self-Drafting (SSD family: LayerSkip, Kangaroo, SWIFT, CLaSp, CAS-Spec, LEAP)** | **EAGLE-based (attached feature-head family: EAGLE, EAGLE-2, DREAM, ViSpec, HiViS, MSD)** |
+|---|---|---|
+| **Model count / memory** | One model, one weight set. Kangaroo's adapter is the only exception (~67M extra) — negligible next to a full second model. | Two logical components: frozen target + trained draft head. EAGLE's head is tiny (~1 layer, <1B even for 70B targets), so memory overhead is still small, but it's a second artifact to store, version, and load. |
+| **KV-cache handling** | **Free, automatic sharing** — layers 1…E computed once, reused by both draft and verify (LayerSkip, Kangaroo). No cache alignment problem exists by construction. | Needs the drafter to build its own cache. EAGLE feeds target features + shifted token embeddings directly (no separate prefill of raw tokens, but still a distinct cache structure); HiViS/ViSpec had to specifically engineer around this (hiding visual tokens, reusing target hidden states) to avoid a redundant/misaligned prefill. |
+| **Setup cost** | SWIFT, CLaSp, CAS-Spec, LEAP: **zero training** — pure inference-time search/selection over which layers to skip. LayerSkip needs the target retrained with layer dropout + early-exit loss (heavier). Kangaroo needs only a tiny adapter trained. | Always requires training a dedicated head (few GPU-days on ShareGPT-scale data for EAGLE) — cheap relative to pretraining, but never zero, and needed per target model. |
+| **Drafter specialization / acceptance ceiling** | Early/shallow layers are a **compromise representation** — never trained purely to predict the final output (except LayerSkip, which does train for this, at the cost of touching the target). Reported speedups cluster **1.3×–2.3×** (SWIFT ≤1.6×, CLaSp ≤1.67×, Kangaroo ≤2.04×, CAS-Spec ≤2.3× via cascading). | A dedicated head trained specifically to predict the target's next feature reaches **higher acceptance length** — EAGLE 2.7–3.5×, DREAM up to 3.6×, ViSpec up to 3.22×. Specialization buys real headroom the self-drafting family hasn't matched. |
+| **Adaptivity to input** | SWIFT/CLaSp/LEAP explicitly re-optimize which layers to skip **per input or per step** (task-specific layer sparsity is their whole premise) — a flexibility EAGLE-style fixed heads don't have built in. | The head is fixed after training; it doesn't adapt its "depth" or which features it reads per input (DREAM's entropy-based intermediate-layer selection is the closest analog, but the head architecture itself is static). |
+| **Portability across targets** | SWIFT/CLaSp/LEAP/CAS-Spec are genuinely **plug-and-play** on any off-the-shelf checkpoint, no retraining — huge practical advantage when you don't control the target's training pipeline. LayerSkip/Kangaroo need at least light modification of or addition to the target. | Head must be (re)trained per target model — not portable to a new target without a training run, though the training itself is cheap. |
+| **Multimodal / visual grounding** | No published SSD variant handles vision-specific drafting well yet (FastVLM-SSD is the one exception, and it borrows EAGLE-style imitation-network training to get there) — self-drafting's "free" simplicity hasn't been shown to extend cleanly to visual token handling. | This is EAGLE's proven expansion path: MSD, ViSpec, MASSV, DREAM, HiViS, SpecVLM all successfully extend the attached-head idea to VLMs, each solving the visual-token/drafter-alignment problem in a different way. |
+| **Systems complexity at scale** | Simple — one model to serve, no tokenizer/family mismatch possible, no separate drafter lifecycle to keep in sync as the target updates. | Extra engineering: tree-attention kernels, cache management for two structures, and (per DSpark's diagnosis) a **separate object to keep aligned** as the target evolves — a real operational cost in production over time. |
+| **Failure mode when pushed hard** | Ceiling is architectural: shallow layers have limited capacity no matter how well you select them (LEAP's zone-search and CLaSp's per-token DP are both fighting the same wall). | Failure mode is distributional: a head trained on fixed data plateaus (Draft-OPD's central finding) unless retrained on-policy — a training problem, not an architectural one, and therefore more fixable with better data/objectives. |
+
+## The one-line summary
+
+**Self-drafting** wins on simplicity, deployment cost, and — for the training-free variants — zero setup cost and universal applicability; it loses on raw acceptance-length ceiling because shallow layers are a compromise, not a specialist.
+
+**EAGLE-based** wins on acceptance length and thus raw speedup, and has a clear, repeatedly-proven path to specialization (including into multimodal territory); it loses on deployment simplicity, needing a second trained artifact per target that must be kept in sync.
 
 
 # Paper 1 — EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty (arXiv:2401.15077, ICML 2024)
