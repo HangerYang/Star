@@ -734,6 +734,114 @@ Under single-sequence verification, up to **1.68×** speedup on Spec-Bench; with
 **Positioning note:** Kangaroo is the missing link between LayerSkip (Paper 9) and the SWIFT/CLaSp/CAS-Spec/LEAP lineage (Papers 15–18) — architecturally it's LayerSkip's shared-prefix idea (draft = fixed shallow layers of the target, full cache sharing), but instead of retraining the base model with layer dropout, it adds a **tiny trained adapter** (EAGLE-style) on top of the frozen shallow layers, and instead of a fixed drafting length, it adds a **confidence-based early stop within the draft phase itself** — the "double" exit. This is directly relevant to your idea 2.1: Kangaroo shows that a frozen shallow prefix + small trained bridge can beat far larger dedicated draft models, which supports top-truncated shearing (rather than scattered pruning) as the more practical starting point, since it gets KV-cache sharing for free exactly as Kangaroo does.
 
 
+
+# Token Compression Methods for Visual Tasks — 3 Papers
+
+---
+
+## Paper A — FastV: An Image is Worth 1/2 Tokens After Layer 2 (arXiv:2403.06764, ECCV 2024)
+
+**1. Challenges it's trying to solve**
+
+Vision-language models process hundreds to thousands of visual tokens per image, and because Transformer cost scales roughly quadratically with sequence length, this visual token count dominates inference FLOPs — often far more than the accompanying text. The question FastV asks is whether all of that visual computation is actually being used by the model in later layers, or whether it's wasted.
+
+**2. Methods**
+
+FastV starts from an empirical observation: visual signal redundancy leads image-related, instruction-specific features to aggregate onto certain "anchor" tokens through self-attention in the shallow layers, and these anchor tokens are rarely image tokens themselves — so in deep layers, attention concentrates on the anchors and largely abandons the original image tokens. Based on this, FastV is a **training-free, plug-and-play pruning method**: computation proceeds normally up through a chosen early layer, and beyond that layer image tokens are re-ranked by the average attention score they've received; tokens below a threshold are discarded from all subsequent layers. Because tokens are dropped outright (not just masked in attention), this also skips their FFN compute in deep layers, not just their self-attention cost.
+
+**3. Loss**
+
+None — FastV requires no training or fine-tuning; it is a pure inference-time intervention on a frozen pretrained model.
+
+**4. Training data**
+
+Not applicable (training-free).
+
+**5. Final results**
+
+On LLaVA-1.5-13B, filtering 50% of image tokens after layer 2 causes no loss in average performance across a combination of benchmarks, and overall FastV achieves up to a 45% FLOPs reduction on LLaVA-1.5-13B without sacrificing performance across a wide range of image and video understanding tasks, and can compress a 13B model's FLOPs below a 7B model's while still outperforming it.
+
+---
+
+## Paper B — LLaVA-PruMerge: Adaptive Token Reduction for Efficient Large Multimodal Models (arXiv:2403.15388, ICCV 2025)
+
+**1. Challenges it's trying to solve**
+
+Same root problem as FastV — LMM visual token counts are large and costly — but PruMerge asks whether a *fixed* pruning ratio is even the right frame, since different images carry very different amounts of information density (a text-heavy screenshot vs. a plain sky photo shouldn't need the same number of tokens).
+
+**2. Methods**
+
+PruMerge operates at the vision-encoder output, before the LLM, and is training-free by default. It exploits sparsity in the CLIP ViT's own attention: most spatial visual tokens have near-zero attention with the [CLS] token, so the unpruned/kept tokens are first selected based on their similarity to the class token and to other spatial tokens, giving an **adaptive** budget per image (dense images keep more tokens, simple ones keep fewer). Rather than simply throwing away the discarded tokens, PruMerge then clusters the pruned tokens by key similarity and merges them back into the retained set to supplement their information — a prune-then-merge combination, not pruning alone. A "PruMerge+" variant additionally adds spatially uniform sampling from initially-discarded regions, guided by the distribution of outlier tokens, to give more comprehensive coverage and reduce performance loss under aggressive compression.
+
+**3. Loss**
+
+Training-free in its base form. Where fine-tuning is used (to adapt the LLM to the reduced token budget), it follows standard LMM instruction-tuning cross-entropy loss — the paper's core contribution is the selection/merge mechanism, not a new objective.
+
+**4. Training data**
+
+None required for the base method; any fine-tuned variant reuses the standard LLaVA instruction-tuning data.
+
+**5. Final results**
+
+Applied to LLaVA-1.5, the approach compresses visual tokens by 18× on average while achieving comparable performance across diverse visual question-answering and reasoning tasks, and more broadly reduces LMM prefill FLOPs by roughly 4–10× while maintaining comparable performance.
+
+---
+
+## Paper C — VisionZip: Longer is Better but Not Necessary in Vision Language Models (arXiv:2412.04467, CVPR 2025)
+
+**1. Challenges it's trying to solve**
+
+VisionZip pushes back on the implicit assumption that "more visual tokens = better performance." It targets the same redundancy problem as FastV/PruMerge but designs specifically to avoid the two common failure modes of naive pruning: (a) losing small-but-important details when only the most-attended tokens are kept, and (b) a train/inference mismatch when token count is cut sharply.
+
+**2. Methods**
+
+VisionZip is **text-agnostic** and works at the vision-encoder side, with training-free, fine-tuning, and train-from-scratch variants. It has two stages: first select dominant tokens — those receiving significant attention and aggregating most of the image information — then, to avoid missing small but potentially important details, merge the remaining tokens by similarity into "contextual tokens" that supplement the dominant set. The attention signal used for stage one is the same CLS-token attention pattern PruMerge exploits: in early layers attention is broadly distributed across the image, but by middle layers it suddenly converges onto a few tokens, and in deeper layers attention and information concentrate on this small dominant set. For the fine-tuning variant, because the input token count drops sharply, there's a slight misalignment between the reduced visual input space and the LLM's expected space, which a lightweight projector fine-tuning step corrects.
+
+**3. Loss**
+
+Training-free mode: none. Fine-tuning mode: standard next-token cross-entropy on the projector only (analogous to adapter-style tuning), correcting the input-distribution shift caused by the reduced token count rather than teaching new visual understanding.
+
+**4. Training data**
+
+Training-free mode needs none. The fine-tuning variant reuses standard LLaVA-style instruction-tuning data, applied briefly to the projector.
+
+**5. Final results**
+
+Reported on LLaVA-1.5 and LLaVA-NeXT-class models, VisionZip retains a small fraction of the original 576 visual tokens (down to the tens of tokens) while keeping accuracy close to the full-token baseline, and the fine-tuned variant narrows the gap further versus training-free pruning at the same aggressive budget — consistent with follow-up work benchmarking against it (e.g., OccamToken, GreedyPrune) as one of the standard strong training-free baselines in this space.
+
+---
+
+**Positioning note:** These three sit on a clear lineage. FastV prunes *inside the LLM decoder*, using cross-modal attention collapse in deep layers as its signal — closest in spirit to Kangaroo's "confidence-gated early exit," except the gate here is attention mass, not token-prediction confidence. PruMerge and VisionZip both operate *at the vision-encoder boundary*, using CLS-token attention sparsity to select dominant tokens, then differ mainly in whether/how they recover information from the discarded tokens (similarity-based merge in both, plus PruMerge+'s uniform-sampling supplement). None of the three train a separate drafting network the way Kangaroo does — they're all closer to "prune what's redundant" than "predict then verify," which is the key structural difference between token-compression-for-vision and self-speculative-decoding-for-text.
+
+
+
+SparseVLM: Visual Token Sparsification for Efficient Vision-Language Model Inference (arXiv:2410.04417, ICML 2025)
+
+**1. Challenges it's trying to solve**
+
+Existing token-reduction methods either need a trained pruning network with extra training data, or — when they do prune during LLM decoding — ignore the guidance available from the text/instruction tokens entirely, which the authors argue contradicts the multimodal nature of the task: the model should attend to different image regions (foreground vs. background) depending on what the question actually asks.
+
+**2. Methods**
+
+SparseVLM is **training-free and text-guided**. Instead of scoring visual tokens purely by internal image-encoder attention (as FastV/PruMerge/VisionZip do), it selects the visual-relevant *text* tokens and uses those to rate the significance of each visual token within the self-attention matrix extracted from the VLM — i.e., pruning decisions are conditioned on the prompt, not just the image. Pruning is progressive across layers rather than a one-shot cut, and the sparsification ratio per layer is set adaptively via a rank-based strategy rather than a fixed global ratio. Pruned tokens aren't simply discarded: a token-recycling mechanism compresses them into more compact representations so some of their information is retained rather than fully lost.
+
+**3. Loss**
+
+None — no additional parameters or fine-tuning; the method operates entirely on a frozen VLM's existing attention matrices.
+
+**4. Training data**
+
+Not applicable (training-free).
+
+**5. Final results**
+
+LLaVA equipped with SparseVLM achieves a 54% reduction in FLOPs and a 37% decrease in CUDA latency while maintaining 97% of its original accuracy; the method also extends to video (VideoLLaVA) by sparsifying across the temporal dimension.
+
+---
+
+**Updated positioning note:** SparseVLM's distinguishing move relative to PruMerge and VisionZip is *where the pruning signal comes from* — those two score tokens using only the vision encoder's internal (CLS-token) attention, text-agnostic; SparseVLM instead lets the instruction/question steer which visual tokens survive, layer-by-layer, with an adaptive per-layer budget instead of one global ratio. All three remain training-free pruning/merging methods rather than trained-drafter approaches, so the same caveat as before applies: none of them are the "trained small predictor + verify" structure that Kangaroo uses for text.
+
+
 # Proposed Method: Draft Model Construction via Layer Selection and On-Policy Self-Distillation
 
 ## Motivation
