@@ -733,7 +733,37 @@ Under single-sequence verification, up to **1.68×** speedup on Spec-Bench; with
 
 **Positioning note:** Kangaroo is the missing link between LayerSkip (Paper 9) and the SWIFT/CLaSp/CAS-Spec/LEAP lineage (Papers 15–18) — architecturally it's LayerSkip's shared-prefix idea (draft = fixed shallow layers of the target, full cache sharing), but instead of retraining the base model with layer dropout, it adds a **tiny trained adapter** (EAGLE-style) on top of the frozen shallow layers, and instead of a fixed drafting length, it adds a **confidence-based early stop within the draft phase itself** — the "double" exit. This is directly relevant to your idea 2.1: Kangaroo shows that a frozen shallow prefix + small trained bridge can beat far larger dedicated draft models, which supports top-truncated shearing (rather than scattered pruning) as the more practical starting point, since it gets KV-cache sharing for free exactly as Kangaroo does.
 
-Want me to fold this into the running comparison table alongside the other 22, or keep going if more papers are coming?
+
+# Proposed Method: Draft Model Construction via Layer Selection and On-Policy Self-Distillation
+
+## Motivation
+
+Training-based speculative decoding (EAGLE family) achieves the strongest speedups but has two structural weaknesses. First, the drafter is a **freshly initialized module** — it discards the target's internal circuitry and must relearn prediction from scratch, capping acceptance length. Second, methods with larger, more capable drafters pay a **memory and deployment cost** (a second model artifact to store, serve, and keep in sync). Self-speculative methods (LayerSkip, Kangaroo, SWIFT/CLaSp/LEAP) avoid both by reusing the target's own layers, but are limited to contiguous shallow prefixes or training-free inference-time skipping, leaving a large acceptance gap versus trained drafters (≈1.3–2.3× vs. 2.7–3.6×).
+
+**Goal:** EAGLE-level (or better) speedup and acceptance length, at self-speculative-level memory overhead — for VLM targets, where visual tokens make drafting disproportionately expensive.
+
+**Core idea:** construct the drafter *from the target itself* — select an importance-ranked, possibly non-contiguous subset of the target's layers, adapt it with lightweight LoRA/MLP modules (base weights untouched and shared), heal it with on-policy self-distillation, and feed it compressed visual input.
+
+## Method
+
+**Stage 1 — Layer selection (criterion: one of two options, ablated).**
+(a) *SFT-gradient probe:* brief fine-tuning of the full model on task data; rank layers by accumulated gradient magnitude. (b) Alternatively, use the gradient for the agreement loss. Entropy- and attention-sum-based rankings as secondary baselines. Depth-only selection. 
+
+**Stage 2 — Parameter-efficient adaptation.**
+LoRA + small MLPs on kept layers only; frozen base weights are shared with the target. KV-cache handling, (1) KV-invariant LoRA — adapt q/o/MLP but freeze k/v projections so the target's cache is directly attendable; (2) learned cache projection (Cache-to-Cache) mapping target KV into drafter space.
+
+**Stage 3 — On-policy self-distillation.**
+Supervision from the frozen target model during training, evaluated on the drafter's own rollout states including verification-rejected positions (Draft-OPD; EAGLE-3's training-time test). Loss stack:
+- *Primary:* divergence on logits — JS as default (balances mode-seeking/greedy vs. mass-covering/sampled acceptance).
+- *Attention alignment:* drafter attention over visual tokens matched to the target's via **group matching** — each kept layer matched to the averaged attention of the teacher span it absorbs (kept layer + preceding skipped layers), cosine distance.
+- *Intermediate hidden-state supervision:* normalized-MSE matching at kept layers via the inherited identity mapping
+
+**Stage 4 — Visual token compression at the drafter input.**
+The full target prefills first (required for verification anyway), so its visual features exist before drafting; the drafter consumes a compressed selection rather than raw visual tokens (SmolVLM: small models want fewer visual tokens). Options: (i) resampler over target visual features, optionally pool-anchored elastic queries (PARCEL) for budget-adaptive compression; (ii) prune-then-resample (attention-scored pruning first); (iii) zero visual tokens, relying on target text-position hidden states (HiViS limiting case). An MLP down-projects fused target features before injection into drafter layers (ViSpec adaptor / EAGLE-3 fusion).
+
+**Inference pipeline.** Target prefill → drafter drafts (kept layers + adapters, compressed visual context, shared/regenerated KV per Stage-2 choice) → target verifies with standard lossless rejection sampling → repeat.
+
+**Evaluation plan.** Metrics: acceptance length τ, relative drafter cost c, wall-clock speedup, drafter memory overhead, per-token-type acceptance (visual-grounded vs. function tokens, MSD diagnostic). Baselines: EAGLE-2/3, ViSpec, HiViS (trained); CLaSp/LEAP (training-free floor); MASSV (independent small drafter). Targets: one LLaVA-family and one Qwen-VL-family model.
 
 
 
