@@ -1,0 +1,24 @@
+# LEAP: Zone-Aware MCTS for LLM Self-Speculative Decoding
+
+**Introduction**
+----
+LEAP is a **zone-aware MCTS-based self-speculative decoding** framework that adaptively constructs a lightweight draft model from the target model itself. This method provide a *plug-and-play* and *lossless* solution for accelerating LLM inference.
+
+LEAP divides LLM inference acceleration into two distinct stages:
+
+- **Prefilling-based initialization:** Estimate layer redundancy from the prefilling stage and organize layers into redundancy-aware zones and groups.
+- **MCTS-guided acceleration:** Use Monte Carlo Tree Search (MTCTS) to explore layer-group actions and construct an efficient draft model for speculative decoding.
+
+During the initialization stage, LEAP computes redundancy signals from intermediate features and output distributions. Based on these signals, layers are partitioned into **early**, **middle**, and **final** zones. Consecutive layers within each zone are further merged into groups to reduce the search space.
+
+During the MCTS-guided acceleration stage, MCTS adaptively selects group-level actions, including **execute**, **skip**, and **repeat**, and evaluates each candidate configuration through real-time speedup feedback. This optimization is performed **for every instance**, allowing LEAP to adapt the draft model to each sample before fixing the best-performing configuration for the remaining decoding process.
+
+<p align="center">
+  <img src="assets/leap.png" width="95%">
+</p>
+
+**Code Release Status**
+----
+This repository is currently under active cleanup. At this stage, we release several core Python files that implement the main components of LEAP, including initialization stage and MCTS.
+
+A complete runnable pipeline and usage instructions will be released in future.
