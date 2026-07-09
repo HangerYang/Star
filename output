@@ -1,0 +1,11 @@
+Model	Vanilla (test)	SWIFT (outputs)	Speedup	Mean accepted tokens
+llama-2-13b
+20.1 tok/s
+27.1 tok/s
+1.35×
+4.14
+smollm2-135m
+59.5 tok/s
+45.3 tok/s
+0.76× (slower)
+1.76

@@ -3,12 +3,29 @@ import argparse
 import numpy as np
 
 
-def speed(jsonl_file, jsonl_file_base, datanum=10, report=True, report_sample=True):
-    data = []
-    with open(jsonl_file, 'r', encoding='utf-8') as file:
+def load_samples(jsonl_file):
+    """Load per-example records; skip summary/footer lines without ``choices``."""
+    samples = []
+    with open(jsonl_file, "r", encoding="utf-8") as file:
         for line in file:
             json_obj = json.loads(line)
-            data.append(json_obj)
+            if "choices" in json_obj:
+                samples.append(json_obj)
+    return samples
+
+
+def speed(jsonl_file, jsonl_file_base, datanum=None, report=True, report_sample=True):
+    data = load_samples(jsonl_file)
+    data_base = load_samples(jsonl_file_base)
+    if not data or not data_base:
+        raise ValueError(
+            f"No valid samples with 'choices' found in:\n  {jsonl_file}\n  {jsonl_file_base}"
+        )
+
+    if datanum is None or datanum <= 0:
+        datanum = min(len(data), len(data_base))
+    else:
+        datanum = min(datanum, len(data), len(data_base))
 
     speeds=[]
     accept_lengths_list = []
@@ -18,16 +35,8 @@ def speed(jsonl_file, jsonl_file_base, datanum=10, report=True, report_sample=Tr
         accept_lengths_list.extend(datapoint["choices"][0]['accept_lengths'])
         speeds.append(tokens/times)
 
-
-    data = []
-    with open(jsonl_file_base, 'r', encoding='utf-8') as file:
-        for line in file:
-            json_obj = json.loads(line)
-            data.append(json_obj)
-
-
     speeds0=[]
-    for datapoint in data[:datanum]:
+    for datapoint in data_base[:datanum]:
         tokens = sum(datapoint["choices"][0]['new_tokens'])
         times = sum(datapoint["choices"][0]['wall_time'])
         speeds0.append(tokens/times)
@@ -75,6 +84,14 @@ if __name__ == "__main__":
         help="The file path of evaluated baseline.",
     )
 
+    parser.add_argument(
+        "--datanum",
+        default=0,
+        type=int,
+        help="Number of examples to include (0 = use all valid records).",
+    )
+
     args = parser.parse_args()
+    datanum = args.datanum if args.datanum > 0 else None
 
     speed(jsonl_file=args.file_path, jsonl_file_base=args.base_path, datanum=datanum)

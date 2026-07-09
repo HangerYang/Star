@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.env
+.venv/
+venv/
+logs/
+ViSpec/vispec_data/
