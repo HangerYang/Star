@@ -1,0 +1,6 @@
+{
+    "eagle_file": "./results/qwen3-1.7b-temperature-0.0-eagle.jsonl",
+    "baseline_file": "./results/qwen3-1.7b-temperature-0.0-baseline.jsonl",
+    "acceptance_length": 3.9084828224847272,
+    "speedup_ratio": 2.066447740124677
+}
