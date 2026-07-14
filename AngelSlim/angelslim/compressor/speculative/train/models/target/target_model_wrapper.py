@@ -674,13 +674,20 @@ class TransformersBackend(BaseBackend):
         Returns:
             Dictionary of model loading arguments
         """
+        attn_implementation = os.environ.get("ANGELSLIM_TARGET_ATTN_IMPLEMENTATION")
+        if attn_implementation is None:
+            try:
+                import flash_attn  # noqa: F401
+
+                attn_implementation = "flash_attention_2"
+            except ImportError:
+                attn_implementation = "sdpa"
+
         default_kwargs = {
             "torch_dtype": torch.bfloat16,
             "device_map": device,
             "trust_remote_code": True,
-            # AngelSlim DFlash uses flash_attention_2 by default to match
-            # the inference kernel and avoid train/test mismatch.
-            "attn_implementation": "flash_attention_2",
+            "attn_implementation": attn_implementation,
         }
         # Only pass through kwargs that are valid for from_pretrained;
         # filter out non-model kwargs like modal_type, target_model_type, etc.
@@ -1497,7 +1504,7 @@ class VLLMBackend(BaseBackend):
         - qwen3: Qwen3 series text LLMs
     """
 
-    SUPPORT_MODEL_TYPE = ["qwen2.5", "qwen3"]
+    SUPPORT_MODEL_TYPE = ["qwen2.5", "qwen3", "smollm2"]
 
     def load_model(self) -> None:
         """Load LLM model using vLLM.

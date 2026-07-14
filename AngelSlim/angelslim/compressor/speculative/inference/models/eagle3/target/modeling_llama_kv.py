@@ -265,7 +265,15 @@ class LlamaRotaryEmbedding_L31(nn.Module):
             self.config, device, **self.rope_kwargs
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    def _ensure_inv_freq(self, device):
+        if self.inv_freq.device.type == "meta" or not torch.any(self.inv_freq):
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
     @staticmethod
     def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
@@ -307,6 +315,7 @@ class LlamaRotaryEmbedding_L31(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        self._ensure_inv_freq(x.device)
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 

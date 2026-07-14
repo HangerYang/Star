@@ -54,16 +54,20 @@ class DatasetBuilderFactory:
         **kwargs: Any,
     ) -> DatasetBuilder:
         """Create a dataset builder instance based on training_mode and modal_type."""
-        if (training_mode, modal_type, target_model_type) not in cls._builders:
+        key = (training_mode, modal_type, target_model_type)
+        if key not in cls._builders and modal_type == "LLM":
+            key = (training_mode, modal_type, None)
+
+        if key not in cls._builders:
             available = list(cls._builders.keys())
             raise ValueError(
-                f"Unknown training_mode '{training_mode}' "
-                f"modal_type '{modal_type}' "
-                f"target_model_type '{target_model_type}'. "
+                f"Unknown training_mode {training_mode!r} "
+                f"modal_type {modal_type!r} "
+                f"target_model_type {target_model_type!r}. "
                 f"Available: {available}"
             )
 
-        builder_class = cls._builders[(training_mode, modal_type, target_model_type)]
+        builder_class = cls._builders[key]
         return builder_class(**kwargs)
 
     @classmethod

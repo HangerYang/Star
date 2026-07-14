@@ -128,6 +128,41 @@ class ModelLoader:
         raise FileNotFoundError(f"EAGLE model weights not found in {eagle_model_path}")
 
 
+def validate_eagle_config_compatible(
+    config: Eagle3Config,
+    base_model: nn.Module,
+    base_model_path: str,
+    eagle_model_path: str,
+) -> None:
+    """Validate that the drafter config is an EAGLE checkpoint for this base."""
+    if not hasattr(config, "draft_vocab_size"):
+        raise ValueError(
+            f"{eagle_model_path} does not look like an EAGLE3 draft checkpoint: "
+            "its config is missing 'draft_vocab_size'. Pass a trained EAGLE3 "
+            f"checkpoint that was built for base model {base_model_path}, not a "
+            "regular base/instruct LM checkpoint."
+        )
+
+    base_config = getattr(base_model, "config", None)
+    if base_config is None:
+        return
+
+    mismatches = []
+    for field in ("hidden_size", "vocab_size"):
+        base_value = getattr(base_config, field, None)
+        eagle_value = getattr(config, field, None)
+        if base_value is not None and eagle_value is not None and base_value != eagle_value:
+            mismatches.append(f"{field}: base={base_value}, eagle={eagle_value}")
+
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(
+            f"EAGLE3 draft checkpoint {eagle_model_path} is not compatible with "
+            f"base model {base_model_path} ({mismatch_text}). Use an EAGLE3 "
+            "draft checkpoint trained for the same base model."
+        )
+
+
 class PerformanceBenchmark:
     """Handles performance benchmarking for optimal token selection"""
 
@@ -359,6 +394,9 @@ class Eagle3Model(nn.Module):
         # Load configuration
         config_path = ModelLoader.ensure_config_path(eagle_model_path)
         config = Eagle3Config.from_pretrained(config_path)
+        validate_eagle_config_compatible(
+            config, base_model, base_model_path, eagle_model_path
+        )
 
         # Initialize EAGLE layer
         device = next(base_model.parameters()).device
@@ -698,6 +736,9 @@ class CosyVoice3Eagle3Model(Eagle3Model):
         # Load configuration
         config_path = ModelLoader.ensure_config_path(eagle_model_path)
         config = Eagle3Config.from_pretrained(config_path)
+        validate_eagle_config_compatible(
+            config, base_model, base_model_path, eagle_model_path
+        )
 
         # Initialize EAGLE layer
         device = next(base_model.model.llm.parameters()).device
