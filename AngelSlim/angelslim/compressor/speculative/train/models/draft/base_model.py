@@ -16,6 +16,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
+from typing import Optional
 
 import torch
 from huggingface_hub import snapshot_download
@@ -47,6 +48,20 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
 
     def get_input_embeddings(self):
         return self.embed_tokens
+
+    def _resolve_model_path(self, model_name_or_path: str) -> str:
+        """Resolve a local directory for a local path or HF repo id."""
+        if not os.path.exists(model_name_or_path):
+            model_name_or_path = snapshot_download(repo_id=model_name_or_path)
+        return model_name_or_path
+
+    def load_pretrained_weight(self, model_name_or_path: str, weight_key: str) -> Optional[torch.Tensor]:
+        """Load a single named tensor from a pretrained checkpoint."""
+        model_path = self._resolve_model_path(model_name_or_path)
+        tensor = self._load_from_safetensors(model_path, weight_key)
+        if tensor is None:
+            tensor = self._load_from_pytorch_bin(model_path, weight_key)
+        return tensor
 
     def freeze_embed_weights(self):
         for param in self.embed_tokens.parameters():
@@ -88,15 +103,7 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
             HuggingFace model identifier (e.g., 'Qwen/Qwen2-7B')
             embed_weight_key: Key for the embedding weights in the model file
         """
-        # Handle HuggingFace model identifier
-        if not os.path.exists(target_model_name_or_path):
-            # print(f"Downloading model from HuggingFace: {target_model_name_or_path}")
-            target_model_name_or_path = snapshot_download(repo_id=target_model_name_or_path)
-
-        # Try loading embedding weights
-        tensor = self._load_from_safetensors(target_model_name_or_path, embed_weight_key)
-        if tensor is None:
-            tensor = self._load_from_pytorch_bin(target_model_name_or_path, embed_weight_key)
+        tensor = self.load_pretrained_weight(target_model_name_or_path, embed_weight_key)
 
         if tensor is None:
             raise FileNotFoundError(
@@ -106,6 +113,37 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
 
         with torch.no_grad():
             self.embed_tokens.weight.copy_(tensor)
+
+    def load_lm_head_weights(self, target_model_name_or_path, lm_head_key="lm_head.weight"):
+        """
+        Load lm_head weights from pretrained model using the already-built vocab mapping.
+
+        The target lm_head is full-vocabulary sized, while the draft lm_head is
+        ``draft_vocab_size``. We therefore gather only the rows referenced by ``d2t``.
+        """
+        tensor = self.load_pretrained_weight(target_model_name_or_path, lm_head_key)
+
+        if tensor is None:
+            raise FileNotFoundError(
+                f"Could not find lm_head weights in {target_model_name_or_path}. "
+                "Expected either safetensors or pytorch_model.bin format."
+            )
+
+        if tensor.shape[0] < int(self.d2t.max().item()) + 1:
+            raise ValueError(
+                f"lm_head tensor shape {tuple(tensor.shape)} is incompatible with "
+                f"vocab mapping max token id {int(self.d2t.max().item())}."
+            )
+
+        reduced_tensor = tensor[self.d2t.long()].to(dtype=self.lm_head.weight.dtype)
+        if reduced_tensor.shape != self.lm_head.weight.shape:
+            raise ValueError(
+                f"Reduced lm_head shape {tuple(reduced_tensor.shape)} does not match "
+                f"draft lm_head shape {tuple(self.lm_head.weight.shape)}."
+            )
+
+        with torch.no_grad():
+            self.lm_head.weight.copy_(reduced_tensor)
 
     def _load_from_safetensors(self, model_path, embed_weight_key="model.embed_tokens.weight"):
         """Load embedding weights from safetensors format."""
@@ -125,9 +163,10 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
                 safetensors_file = os.path.join(model_path, "model.safetensors")
 
             with safe_open(safetensors_file, framework="pt", device="cpu") as f:
-                tensor_slice = f.get_slice(embed_weight_key)
-                _, hidden_dim = tensor_slice.get_shape()
-                tensor = tensor_slice[:, :hidden_dim].float()
+                resolved_key = self._resolve_weight_key(f.keys(), embed_weight_key)
+                if resolved_key is None:
+                    raise KeyError(f"Weight key not found: {embed_weight_key}")
+                tensor = f.get_tensor(resolved_key).float()
 
             return tensor
         except Exception as e:
@@ -155,12 +194,26 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
                 bin_file = os.path.join(model_path, "pytorch_model.bin")
 
             weights = torch.load(bin_file, map_location="cpu")
-            tensor = weights[embed_weight_key].float()
+            resolved_key = self._resolve_weight_key(weights.keys(), embed_weight_key)
+            if resolved_key is None:
+                raise KeyError(f"Weight key not found: {embed_weight_key}")
+            tensor = weights[resolved_key].float()
 
             return tensor
         except Exception as e:
             print(f"Failed to load from pytorch_model.bin: {e}")
             return None
+
+    def _resolve_weight_key(self, available_keys, requested_key: str) -> Optional[str]:
+        """Resolve a requested checkpoint tensor name to an available key."""
+        if requested_key in available_keys:
+            return requested_key
+
+        # SmolLM2 ties lm_head to embeddings and may omit a standalone lm_head tensor.
+        if requested_key == "lm_head.weight" and "model.embed_tokens.weight" in available_keys:
+            return "model.embed_tokens.weight"
+
+        return None
 
     def build_vocab_mapping(self, dataset, cache_path):
         """

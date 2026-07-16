@@ -21,19 +21,20 @@ if [[ ! -x "$TORCHRUN_BIN" ]]; then
 fi
 
 export CONFIG_DIR=angelslim/compressor/speculative/train/configs
-export TARGET_MODEL_NAME_OR_PATH=Qwen/Qwen3-0.6B
-export DRAFT_MODEL_CONFIG_PATH=$CONFIG_DIR/qwen3-0.6b-eagle3.json
-export TRAIN_DATA_PATH=dataset/train.jsonl
-export EVAL_DATA_PATH=dataset/val.jsonl
-export OUTPUT_DIR=outputs/qwen3-0.6b-eagle3-online
-export MODEL_MAX_LENGTH=2048
-export CHAT_TEMPLATE_TYPE=qwen3
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TARGET_MODEL_NAME_OR_PATH=${TARGET_MODEL_NAME_OR_PATH:-HuggingFaceTB/SmolLM2-135M-Instruct}
+export DRAFT_MODEL_CONFIG_PATH=${DRAFT_MODEL_CONFIG_PATH:-$CONFIG_DIR/smollm2-135m-instruct-eagle3-skip50.json}
+export TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-dataset/train.jsonl}
+export EVAL_DATA_PATH=${EVAL_DATA_PATH:-dataset/val.jsonl}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/smollm2-135m-instruct-eagle3-online-skip50}
+export MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-2048}
+export CHAT_TEMPLATE_TYPE=${CHAT_TEMPLATE_TYPE:-smollm2}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export DEEPSPEED_CONFIG_PATH=${DEEPSPEED_CONFIG_PATH:-$CONFIG_DIR/deepspeed_zero3_no_offload.json}
-export HF_HUB_ETAG_TIMEOUT=60
-export HF_HUB_DOWNLOAD_TIMEOUT=120
+export HF_HUB_ETAG_TIMEOUT=${HF_HUB_ETAG_TIMEOUT:-60}
+export HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-120}
 export MASTER_PORT=${MASTER_PORT:-$((20000 + RANDOM % 10000))}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-/tmp/torch_extensions}
+export NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 
 if [[ ! -d "$TARGET_MODEL_NAME_OR_PATH" ]]; then
@@ -42,12 +43,12 @@ if [[ ! -d "$TARGET_MODEL_NAME_OR_PATH" ]]; then
     )
 fi
 
-"$TORCHRUN_BIN" --master_port "$MASTER_PORT" --nproc_per_node=8 tools/train_eagle3_online.py \
-    --target_model_name_or_path $TARGET_MODEL_NAME_OR_PATH \
-    --draft_model_config_path $DRAFT_MODEL_CONFIG_PATH \
-    --train_data_path $TRAIN_DATA_PATH \
-    --eval_data_path $EVAL_DATA_PATH \
-    --output_dir $OUTPUT_DIR \
+"$TORCHRUN_BIN" --master_port "$MASTER_PORT" --nproc_per_node="$NPROC_PER_NODE" tools/train_eagle3_online.py \
+    --target_model_name_or_path "$TARGET_MODEL_NAME_OR_PATH" \
+    --draft_model_config_path "$DRAFT_MODEL_CONFIG_PATH" \
+    --train_data_path "$TRAIN_DATA_PATH" \
+    --eval_data_path "$EVAL_DATA_PATH" \
+    --output_dir "$OUTPUT_DIR" \
     --num_train_epochs 20 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
@@ -59,8 +60,8 @@ fi
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 20 \
-    --model_max_length $MODEL_MAX_LENGTH \
-    --deepspeed $DEEPSPEED_CONFIG_PATH \
-    --chat_template_type $CHAT_TEMPLATE_TYPE \
+    --model_max_length "$MODEL_MAX_LENGTH" \
+    --deepspeed "$DEEPSPEED_CONFIG_PATH" \
+    --chat_template_type "$CHAT_TEMPLATE_TYPE" \
     --report_to none \
-    --run_name qwen3-0.6b-eagle3-angelslim
+    --run_name smollm2-135m-instruct-eagle3-skip50

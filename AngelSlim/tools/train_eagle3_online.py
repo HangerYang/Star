@@ -78,7 +78,7 @@ def parse_args():
     )
     model_group.add_argument(
         "--trust_remote_code",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Whether to trust remote code when loading models",
     )
@@ -87,6 +87,33 @@ def parse_args():
         type=str,
         default="model.embed_tokens.weight",
         help="Key for embedding weights in model config",
+    )
+    model_group.add_argument(
+        "--lm_head_key",
+        type=str,
+        default="lm_head.weight",
+        help="Key for lm_head weights in model config",
+    )
+    model_group.add_argument(
+        "--draft_init_model_name_or_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional source checkpoint used to initialize the draft layer from "
+            "selected target layers. Defaults to target_model_name_or_path when "
+            "draft_init_keep_layers is provided."
+        ),
+    )
+    model_group.add_argument(
+        "--draft_init_keep_layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional list of target layer indices used to initialize the recurrent "
+            "EAGLE3 draft block. For the current Eagle3Llama draft, multiple source "
+            "layers are averaged into the single recurrent layer."
+        ),
     )
 
     # Data arguments
@@ -286,6 +313,28 @@ def train():
     rank0_print("Loading draft model...")
     rank0_print(f"draft_model_config: {draft_model_config}")
     draft_model = create_draft_model(draft_model_config)
+    draft_init_keep_layers = args.draft_init_keep_layers or getattr(
+        draft_model_config, "draft_init_keep_layers", None
+    )
+    draft_init_model_name_or_path = args.draft_init_model_name_or_path or getattr(
+        draft_model_config, "draft_init_model_name_or_path", None
+    )
+    if draft_init_keep_layers is not None:
+        draft_init_source = draft_init_model_name_or_path or args.target_model_name_or_path
+        if not hasattr(draft_model, "initialize_from_target_layers"):
+            raise ValueError(
+                f"Draft model class {draft_model.__class__.__name__} does not support "
+                "--draft_init_keep_layers."
+            )
+        rank0_print(
+            "Initializing draft layer from target checkpoint "
+            f"{draft_init_source} using layers {draft_init_keep_layers}"
+        )
+        draft_model.initialize_from_target_layers(
+            target_model_name_or_path=draft_init_source,
+            keep_layer_ids=draft_init_keep_layers,
+            embed_weight_key=args.embed_weight_key,
+        )
     draft_model.load_embed_weights(args.target_model_name_or_path, args.embed_weight_key)
     draft_model.freeze_embed_weights()
     rank0_print("Draft model loaded successfully")
@@ -316,6 +365,9 @@ def train():
         dataset=train_dataset,
         cache_path=cache_path,
     )
+    if draft_init_keep_layers is not None:
+        rank0_print("Loading reduced lm_head weights from target checkpoint...")
+        draft_model.load_lm_head_weights(draft_init_source, args.lm_head_key)
     rank0_print("Vocabulary mapping built successfully")
 
     # Create a TrainingArguments object for the trainer

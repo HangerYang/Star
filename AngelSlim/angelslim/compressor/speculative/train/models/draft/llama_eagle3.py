@@ -24,7 +24,11 @@ from huggingface_hub import snapshot_download
 from torch import nn
 from transformers import LlamaConfig
 from transformers.activations import ACT2FN
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+try:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+except ModuleNotFoundError:
+    ROPE_INIT_FUNCTIONS = {}
 
 from ...data.data_utils import process_token_dict_to_mappings
 from ..model_utils import apply_rotary_pos_emb, apply_rotary_pos_emb_mrope, repeat_kv
@@ -411,6 +415,159 @@ class LlamaAttention(nn.Module):
         return attn_output, new_past_key_value
 
 
+class LlamaSelfAttention(nn.Module):
+    """Standard hidden_size -> hidden_size attention for post-fusion layers."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope()
+
+    def _init_rope(self):
+        self.rope_apply_func = apply_rotary_pos_emb
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim, max_position_embeddings=self.max_position_embeddings
+            )
+        else:
+            scaling_type = self.config.rope_scaling.get(
+                "type", self.config.rope_scaling.get("rope_type", "default")
+            )
+            if scaling_type == "mrope" or self.config.rope_scaling.get("mrope_interleaved", False):
+                self.rotary_emb = MRotaryEmbedding(self.config)
+                self.rope_apply_func = apply_rotary_pos_emb_mrope
+            elif scaling_type == "default":
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=self.config.rope_scaling["factor"],
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=self.config.rope_scaling["factor"],
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        lck = len(cache_hidden[0]) if cache_hidden is not None else 0
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(
+            query_states, seq_len=q_len + lck, position_ids=position_ids + lck
+        )
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = self.rope_apply_func(
+            query_states, key_states, cos, sin, position_ids + lck
+        )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        if cache_hidden is None:
+            local_cache_k = []
+            local_cache_v = []
+        else:
+            local_cache_k = list(cache_hidden[0])
+            local_cache_v = list(cache_hidden[1])
+
+        local_cache_k.append(key_states)
+        local_cache_v.append(value_states)
+
+        cache_k = local_cache_k
+        cache_v = local_cache_v
+
+        k0 = cache_k[0]
+        v0 = cache_v[0]
+        lck = len(cache_k)
+
+        if lck == 1:
+            _sdpa_backends = [
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]
+            with torch.nn.attention.sdpa_kernel(_sdpa_backends):
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states, k0, v0, attn_mask=attention_mask
+                )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, -1)
+            attn_output = self.o_proj(attn_output)
+            new_past_key_value = [local_cache_k, local_cache_v]
+            return attn_output, new_past_key_value
+
+        attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = attn_weights + attention_mask
+
+        for i in range(1, lck):
+            ki = cache_k[i]
+            attn_weightsi = (query_states * ki).sum(-1) / math.sqrt(self.head_dim)
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+        attn_weights0 = attn_weights[..., :q_len]
+        attn_output = torch.matmul(attn_weights0, v0)
+
+        for i in range(1, lck):
+            vi = cache_v[i]
+            attn_weightsi = attn_weights[..., q_len + i - 1]
+            attn_output = attn_output + attn_weightsi[..., None] * vi
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+        new_past_key_value = [local_cache_k, local_cache_v]
+        return attn_output, new_past_key_value
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -539,13 +696,58 @@ class LlamaDecoderLayeremb(nn.Module):
         return outputs, latest_hidden_cache
 
 
+class LlamaDecoderLayer(nn.Module):
+    """Standard post-fusion decoder layer operating on hidden_size features."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaSelfAttention(config=config)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, latest_hidden_cache = self.self_attn(
+            cache_hidden=cache_hidden,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return (hidden_states, hidden_states), latest_hidden_cache
+
+
 @DraftModelFactory.register
 class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     config_class = LlamaConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self.midlayer = LlamaDecoderLayeremb(config)
+        self.num_hidden_layers = config.num_hidden_layers
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayeremb(config)]
+            + [LlamaDecoderLayer(config) for _ in range(max(config.num_hidden_layers - 1, 0))]
+        )
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
@@ -573,23 +775,41 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         self,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]],
+        cache_hidden,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         use_cache: bool,
     ):
-        layer_outputs, cache_hidden = self.midlayer(
+        cache_hidden = self._normalize_layer_caches(cache_hidden)
+        new_layer_caches = []
+
+        layer_outputs, layer_cache = self.layers[0](
             inputs_embeds,
             hidden_states,
-            cache_hidden,
+            cache_hidden[0],
             attention_mask,
             position_ids,
             past_key_value=None,
             output_attentions=False,
             use_cache=use_cache,
         )
-        hidden_states_out = layer_outputs[0]
-        return hidden_states_out, cache_hidden
+        hidden_states = layer_outputs[0]
+        new_layer_caches.append(layer_cache)
+
+        for layer_idx, layer in enumerate(self.layers[1:], start=1):
+            layer_outputs, layer_cache = layer(
+                hidden_states,
+                cache_hidden[layer_idx],
+                attention_mask,
+                position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=use_cache,
+            )
+            hidden_states = layer_outputs[0]
+            new_layer_caches.append(layer_cache)
+
+        return hidden_states, new_layer_caches
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
@@ -599,6 +819,175 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def embed_input_ids(self, input_ids):
         inputs_embeds = self.embed_tokens(input_ids)
         return inputs_embeds
+
+    @staticmethod
+    def _model_prefix_from_embed_weight_key(embed_weight_key: str) -> str:
+        suffix = ".embed_tokens.weight"
+        if not embed_weight_key.endswith(suffix):
+            raise ValueError(
+                f"embed_weight_key must end with '{suffix}' to infer layer prefix, "
+                f"got: {embed_weight_key}"
+            )
+        return embed_weight_key[: -len(suffix)]
+
+    @staticmethod
+    def _average_tensors(tensors: List[torch.Tensor]) -> torch.Tensor:
+        if not tensors:
+            raise ValueError("Expected at least one tensor to average.")
+        stacked = torch.stack([tensor.float() for tensor in tensors], dim=0)
+        return stacked.mean(dim=0)
+
+    def _initialize_fc_from_last_aux_hidden(self):
+        """
+        Seed the 3H -> H bridge to preserve the latest auxiliary hidden state.
+
+        Target-model auxiliary hidden states are concatenated as [early, mid, late].
+        Selecting the final H slice makes the draft start from the latest target
+        hidden representation instead of a random projection.
+        """
+        with torch.no_grad():
+            self.fc.weight.zero_()
+            hidden_size = self.hidden_size
+            self.fc.weight[:, 2 * hidden_size : 3 * hidden_size].copy_(
+                torch.eye(hidden_size, dtype=self.fc.weight.dtype, device=self.fc.weight.device)
+            )
+
+    def _normalize_layer_caches(self, cache_hidden):
+        if cache_hidden is None:
+            return [[[], []] for _ in range(self.num_hidden_layers)]
+
+        if (
+            isinstance(cache_hidden, list)
+            and len(cache_hidden) == 2
+            and all(isinstance(item, list) for item in cache_hidden)
+            and (
+                len(cache_hidden[0]) == 0
+                or isinstance(cache_hidden[0][0], torch.Tensor)
+            )
+        ):
+            normalized = [[list(cache_hidden[0]), list(cache_hidden[1])]]
+            normalized.extend([[[], []] for _ in range(self.num_hidden_layers - 1)])
+            return normalized
+
+        if isinstance(cache_hidden, list) and len(cache_hidden) == self.num_hidden_layers:
+            return cache_hidden
+
+        raise ValueError(
+            f"Unexpected cache_hidden structure for {self.num_hidden_layers} layers: "
+            f"{type(cache_hidden)}"
+        )
+
+    def initialize_from_target_layers(
+        self,
+        target_model_name_or_path: str,
+        keep_layer_ids: List[int],
+        embed_weight_key: str = "model.embed_tokens.weight",
+    ) -> None:
+        """
+        Initialize the EAGLE3 draft layers from selected target-model layers.
+
+        Layer 0 is the fused recurrent block, so only its hidden-state half is
+        seeded from the source layer. Later draft layers are standard decoder
+        layers and are copied one-to-one from the corresponding target layers.
+        """
+        if not keep_layer_ids:
+            raise ValueError("keep_layer_ids must contain at least one layer index.")
+        if len(keep_layer_ids) != self.num_hidden_layers:
+            raise ValueError(
+                f"keep_layer_ids length ({len(keep_layer_ids)}) must match "
+                f"draft num_hidden_layers ({self.num_hidden_layers})."
+            )
+
+        model_prefix = self._model_prefix_from_embed_weight_key(embed_weight_key)
+        layer_prefix = f"{model_prefix}.layers"
+        final_norm_key = f"{model_prefix}.norm.weight"
+
+        def load_layer_weight(layer_idx: int, relative_key: str) -> torch.Tensor:
+            weight_key = f"{layer_prefix}.{layer_idx}.{relative_key}"
+            tensor = self.load_pretrained_weight(target_model_name_or_path, weight_key)
+            if tensor is None:
+                raise FileNotFoundError(
+                    f"Could not find target layer weight '{weight_key}' in "
+                    f"{target_model_name_or_path}."
+                )
+            return tensor
+
+        final_norm = self.load_pretrained_weight(target_model_name_or_path, final_norm_key)
+        if final_norm is None:
+            raise FileNotFoundError(
+                f"Could not find final norm weight '{final_norm_key}' in "
+                f"{target_model_name_or_path}."
+            )
+
+        hidden_size = self.hidden_size
+        with torch.no_grad():
+            self._initialize_fc_from_last_aux_hidden()
+            for draft_layer_idx, target_layer_idx in enumerate(keep_layer_ids):
+                q_proj = load_layer_weight(target_layer_idx, "self_attn.q_proj.weight")
+                k_proj = load_layer_weight(target_layer_idx, "self_attn.k_proj.weight")
+                v_proj = load_layer_weight(target_layer_idx, "self_attn.v_proj.weight")
+                o_proj = load_layer_weight(target_layer_idx, "self_attn.o_proj.weight")
+                gate_proj = load_layer_weight(target_layer_idx, "mlp.gate_proj.weight")
+                up_proj = load_layer_weight(target_layer_idx, "mlp.up_proj.weight")
+                down_proj = load_layer_weight(target_layer_idx, "mlp.down_proj.weight")
+                input_layernorm = load_layer_weight(target_layer_idx, "input_layernorm.weight")
+                post_attention_layernorm = load_layer_weight(
+                    target_layer_idx, "post_attention_layernorm.weight"
+                )
+
+                if draft_layer_idx == 0:
+                    layer = self.layers[0]
+                    layer.self_attn.q_proj.weight.zero_()
+                    layer.self_attn.k_proj.weight.zero_()
+                    layer.self_attn.v_proj.weight.zero_()
+                    layer.self_attn.q_proj.weight[:, hidden_size:].copy_(
+                        q_proj.to(dtype=layer.self_attn.q_proj.weight.dtype)
+                    )
+                    layer.self_attn.k_proj.weight[:, hidden_size:].copy_(
+                        k_proj.to(dtype=layer.self_attn.k_proj.weight.dtype)
+                    )
+                    layer.self_attn.v_proj.weight[:, hidden_size:].copy_(
+                        v_proj.to(dtype=layer.self_attn.v_proj.weight.dtype)
+                    )
+                    layer.hidden_norm.weight.copy_(
+                        input_layernorm.to(dtype=layer.hidden_norm.weight.dtype)
+                    )
+                    layer.input_layernorm.weight.copy_(
+                        input_layernorm.to(dtype=layer.input_layernorm.weight.dtype)
+                    )
+                else:
+                    layer = self.layers[draft_layer_idx]
+                    layer.self_attn.q_proj.weight.copy_(
+                        q_proj.to(dtype=layer.self_attn.q_proj.weight.dtype)
+                    )
+                    layer.self_attn.k_proj.weight.copy_(
+                        k_proj.to(dtype=layer.self_attn.k_proj.weight.dtype)
+                    )
+                    layer.self_attn.v_proj.weight.copy_(
+                        v_proj.to(dtype=layer.self_attn.v_proj.weight.dtype)
+                    )
+                    layer.input_layernorm.weight.copy_(
+                        input_layernorm.to(dtype=layer.input_layernorm.weight.dtype)
+                    )
+
+                layer.self_attn.o_proj.weight.copy_(
+                    o_proj.to(dtype=layer.self_attn.o_proj.weight.dtype)
+                )
+                layer.mlp.gate_proj.weight.copy_(
+                    gate_proj.to(dtype=layer.mlp.gate_proj.weight.dtype)
+                )
+                layer.mlp.up_proj.weight.copy_(
+                    up_proj.to(dtype=layer.mlp.up_proj.weight.dtype)
+                )
+                layer.mlp.down_proj.weight.copy_(
+                    down_proj.to(dtype=layer.mlp.down_proj.weight.dtype)
+                )
+                layer.post_attention_layernorm.weight.copy_(
+                    post_attention_layernorm.to(
+                        dtype=layer.post_attention_layernorm.weight.dtype
+                    )
+                )
+            self.norm.weight.copy_(final_norm.to(dtype=self.norm.weight.dtype))
 
     def forward(
         self,
@@ -658,7 +1047,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             if use_cache:
                 use_cache = False
 
-        cache_hidden = [[], []]
+        cache_hidden = self._normalize_layer_caches(None)
 
         inputs_embeds = self.embed_tokens(input_ids)
         if self.training and self.gradient_checkpointing and not inputs_embeds.requires_grad:
@@ -672,20 +1061,34 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
 
             return custom_forward
 
-        layer_outputs, cache_hidden = torch.utils.checkpoint.checkpoint(
-            create_custom_forward(self.midlayer),
+        layer_outputs, layer_cache = torch.utils.checkpoint.checkpoint(
+            create_custom_forward(self.layers[0]),
             inputs_embeds,
             hidden_states,
-            cache_hidden,
+            cache_hidden[0],
             attention_mask,
             position_ids,
         )
+        hidden_states = layer_outputs[0]
+        cache_hidden[0] = layer_cache
 
-        hidden_states_out = layer_outputs[0]
+        for layer_idx, layer in enumerate(self.layers[1:], start=1):
+            def create_standard_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs, None, output_attentions)
 
-        hidden_states = hidden_states_out
+                return custom_forward
 
-        hidden_states_out = self.norm(hidden_states_out)
+            layer_outputs, layer_cache = torch.utils.checkpoint.checkpoint(
+                create_standard_forward(layer),
+                hidden_states,
+                cache_hidden[layer_idx],
+                attention_mask,
+                position_ids,
+            )
+            hidden_states = layer_outputs[0]
+            cache_hidden[layer_idx] = layer_cache
+        hidden_states_out = self.norm(hidden_states)
 
         logits = self.lm_head(hidden_states_out)
         logits = logits.float()
