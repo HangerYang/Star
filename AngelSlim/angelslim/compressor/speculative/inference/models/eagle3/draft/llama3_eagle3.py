@@ -521,6 +521,185 @@ class LlamaDecoderLayeremb(nn.Module):
         return outputs
 
 
+class LlamaSelfAttention(nn.Module):
+    """Standard hidden_size -> hidden_size attention for post-fusion layers."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope()
+
+    def _init_rope(self):
+        rope_params = getattr(self.config, "rope_parameters", None)
+        if rope_params is None:
+            rope_params = getattr(self.config, "rope_scaling", None)
+
+        scaling_type = None
+        scaling_factor = None
+        if rope_params is not None:
+            scaling_type = rope_params.get("rope_type", rope_params.get("type"))
+            scaling_factor = rope_params.get("factor")
+
+        base = getattr(self.config, "rope_theta", 10000)
+        if scaling_type in (None, "default"):
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=base,
+            )
+        elif scaling_type == "linear":
+            self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=base,
+                scaling_factor=scaling_factor,
+            )
+        elif scaling_type == "dynamic":
+            self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=base,
+                scaling_factor=scaling_factor,
+            )
+        else:
+            raise ValueError(f"Unknown rope scaling type: {scaling_type}")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
+
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+            self.head_dim
+        )
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size "
+                f"{(bsz, self.num_heads, q_len, kv_seq_len)}, but is "
+                f"{attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
+                    f"but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+class LlamaDecoderLayer(nn.Module):
+    """Standard post-fusion decoder layer operating on hidden_size features."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaSelfAttention(config=config)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+        return outputs
+
+
 class Llama3Eagle3Drafter(BaseEagle3Drafter):
     def __init__(
         self,
@@ -543,7 +722,11 @@ class Llama3Eagle3Drafter(BaseEagle3Drafter):
             threshold=threshold,
             **kwargs,
         )
-        self.midlayer = LlamaDecoderLayeremb(config)
+        self.num_hidden_layers = config.num_hidden_layers
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayeremb(config)]
+            + [LlamaDecoderLayer(config) for _ in range(max(config.num_hidden_layers - 1, 0))]
+        )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _prepare_decoder_attention_mask(
@@ -655,19 +838,33 @@ class Llama3Eagle3Drafter(BaseEagle3Drafter):
 
         next_decoder_cache = () if use_cache else None
 
-        past_key_value = past_key_values[0] if past_key_values is not None else None
-        layer_outputs = self.midlayer(
+        layer_past = past_key_values[0] if past_key_values is not None else None
+        layer_outputs = self.layers[0](
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_value=layer_past,
             output_attentions=output_attentions,
             use_cache=True,
         )
         if use_cache:
             next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
         hidden_states = layer_outputs[0]
+
+        for layer_idx, layer in enumerate(self.layers[1:], start=1):
+            layer_past = past_key_values[layer_idx] if past_key_values is not None else None
+            layer_outputs = layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=layer_past,
+                output_attentions=output_attentions,
+                use_cache=True,
+            )
+            if use_cache:
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+            hidden_states = layer_outputs[0]
 
         return hidden_states, next_decoder_cache, early_stop_signal
 
