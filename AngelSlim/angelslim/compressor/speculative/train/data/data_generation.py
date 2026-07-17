@@ -10,7 +10,11 @@ from datasets import load_dataset
 
 from angelslim.utils.lazy_imports import openai
 
-from .data_utils import convert_sharegpt_data, convert_ultrachat_data
+from .data_utils import (
+    convert_passthrough_data,
+    convert_sharegpt_data,
+    convert_ultrachat_data,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -226,7 +230,7 @@ def data_generation_work_flow(args):
     # Load input data
     logger.info(f"Loading data from {args.data_name_or_path}")
     try:
-        dataset = load_dataset(args.data_name_or_path, split="all")
+        dataset = load_dataset("json", data_files=args.data_name_or_path, split="train")
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         return
@@ -236,6 +240,8 @@ def data_generation_work_flow(args):
         convert_func = convert_sharegpt_data
     elif args.data_format == "ultrachat":
         convert_func = convert_ultrachat_data
+    elif args.data_format == "converted":
+        convert_func = convert_passthrough_data
     else:
         raise ValueError(f"Invalid data format: {args.data_format}")
     dataset = dataset.map(convert_func, desc="Converting data format..")

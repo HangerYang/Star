@@ -42,8 +42,8 @@ def parse_arguments() -> argparse.Namespace:
         "--data_format",
         type=str,
         default="sharegpt",
-        help="Data format (sharegpt or ultrachat)",
-        choices=["sharegpt", "ultrachat"],
+        help="Data format (sharegpt, ultrachat, or converted)",
+        choices=["sharegpt", "ultrachat", "converted"],
     )
 
     return parser.parse_args()
