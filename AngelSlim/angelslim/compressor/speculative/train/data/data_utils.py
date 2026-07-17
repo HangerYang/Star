@@ -24,6 +24,7 @@ __all__ = [
     "process_token_dict_to_mappings",
     "convert_sharegpt_data",
     "convert_ultrachat_data",
+    "convert_passthrough_data",
     "DataCollatorWithPadding",
     "VLMDataCollatorWithPadding",
     "VLMHunyuanDataCollatorWithPadding",
@@ -89,6 +90,12 @@ def convert_ultrachat_data(row, dataset_column="messages"):
     for message in messages:
         converted_messages.append({"role": message["role"], "content": message["content"]})
     return {"conversations": converted_messages, "id": row["prompt_id"]}
+
+
+def convert_passthrough_data(row, dataset_column="conversations"):
+    # Data is already in the unified {"id", "conversations":[{role, content}]}
+    # format (e.g. *_converted.jsonl), so no conversion is needed.
+    return {"conversations": row[dataset_column], "id": row["id"]}
 
 
 def process_token_dict_to_mappings(
