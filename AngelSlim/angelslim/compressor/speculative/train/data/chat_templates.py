@@ -35,6 +35,7 @@ class ChatTemplateType(Enum):
     HUNYUAN_7B = "hunyuan_7b"
     HUNYUAN_VL = "hunyuan_vl"
     SMOLLM2 = "smollm2"
+    SMOLVLM = "smolvlm"
 
 
 # String to ChatTemplateType mapping
@@ -48,6 +49,7 @@ CHAT_TEMPLATE_TYPE_MAPPING = {
     "qwen3_vl": ChatTemplateType.QWEN3_VL,
     "hunyuan_vl": ChatTemplateType.HUNYUAN_VL,
     "smollm2": ChatTemplateType.SMOLLM2,
+    "smolvlm": ChatTemplateType.SMOLVLM,
 }
 
 
@@ -114,6 +116,19 @@ class ChatTemplateManager:
                     "You are a helpful AI assistant named SmolLM, "
                     "trained by Hugging Face"
                 ),
+            ),
+            ChatTemplateType.SMOLVLM: ChatTemplate(
+                user_header="User:",
+                assistant_header="Assistant:",
+                system_prompt=[
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are a helpful AI assistant named SmolVLM, "
+                            "trained by Hugging Face"
+                        ),
+                    }
+                ],
             ),
             ChatTemplateType.HUNYUAN: ChatTemplate(
                 user_header="<｜hy_User｜>",

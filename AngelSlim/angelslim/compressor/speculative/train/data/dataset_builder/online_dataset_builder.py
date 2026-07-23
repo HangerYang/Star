@@ -431,6 +431,240 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
             return None
 
 
+@DatasetBuilderFactory.register("online", "VLM", "smolvlm")
+class OnlineVLMSmolVLMBuilder(OnlineDatasetBuilder):
+    def __init__(
+        self,
+        tokenizer: Union[AutoTokenizer, AutoProcessor],
+        max_length: int = 2048,
+        shuffle_seed: int = 42,
+        chat_template_type: ChatTemplateType = ChatTemplateType.SMOLVLM,
+        display: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(
+            tokenizer,
+            max_length,
+            shuffle_seed,
+            chat_template_type,
+            display,
+        )
+        _max_pixels = os.environ.get("MAX_PIXELS")
+        _min_pixels = os.environ.get("MIN_PIXELS", "1024")
+        self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
+        self.min_pixels = int(_min_pixels) if _min_pixels is not None else None
+        rank0_print(f"max_pixels: {self.max_pixels}, min_pixels: {self.min_pixels}")
+
+    def build_dataset(
+        self,
+        datapath: str,
+        num_proc: int = 8,
+        shuffle: bool = True,
+        sample_num: Optional[int] = None,
+        min_loss_tokens: Optional[int] = None,
+    ) -> Dataset:
+        try:
+            features = Features(
+                {
+                    "id": Value("string"),
+                    "conversations": [
+                        {
+                            "role": Value("string"),
+                            "content": [
+                                {
+                                    "type": Value("string"),
+                                    "text": Value("string"),
+                                    "image": Value("string"),
+                                    "video": Value("string"),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+            ds = load_dataset("json", data_files=datapath, features=features)
+
+            if shuffle:
+                ds = ds["train"].shuffle(seed=self.shuffle_seed)
+            else:
+                ds = ds["train"]
+
+            if sample_num is not None and 0 < sample_num < len(ds):
+                ds = ds.select(range(sample_num))
+
+            original_columns = ds.column_names
+            processed_ds = ds.map(
+                self._preprocess_function,
+                batched=True,
+                num_proc=num_proc,
+                remove_columns=original_columns,
+                load_from_cache_file=False,
+                desc="Processing conversations",
+            )
+
+            processed_ds = processed_ds.filter(
+                lambda batch: [ids is not None for ids in batch["input_ids"]],
+                batched=True,
+                num_proc=num_proc,
+                desc="Filtering empty input_ids",
+            )
+            if min_loss_tokens is not None:
+                processed_ds = processed_ds.filter(
+                    lambda batch: [
+                        sum(sum(x) if isinstance(x, list) else x for x in m) >= min_loss_tokens
+                        for m in batch["loss_mask"]
+                    ],
+                    batched=True,
+                    num_proc=num_proc,
+                    desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
+                )
+
+            torch_columns = [c for c in processed_ds.column_names if c != "image_paths"]
+            processed_ds.set_format(type="torch", columns=torch_columns, output_all_columns=True)
+            return processed_ds
+        except Exception as e:
+            raise RuntimeError(f"Dataset building failed for {datapath}") from e
+
+    def get_data_collator(self) -> Any:
+        return VLMDataCollatorWithPadding(processor=self.tokenizer)
+
+    def _preprocess_function(self, examples: Dict[str, List]) -> Dict[str, List]:
+        new_examples = {
+            "input_ids": [],
+            "attention_mask": [],
+            "loss_mask": [],
+            "image_paths": [],
+        }
+
+        for i in range(len(examples["id"])):
+            try:
+                processed_example = self._process_single_conversation(examples["conversations"][i])
+                if processed_example is not None:
+                    for key in new_examples.keys():
+                        if key not in processed_example:
+                            new_examples[key].append(None)
+                        else:
+                            new_examples[key].append(processed_example[key])
+            except Exception as e:
+                rank0_print(f"Error processing example: {e}")
+                for key in new_examples:
+                    new_examples[key].append(None)
+
+        cleaned_new_examples = {}
+        for key, value in new_examples.items():
+            if any(v is not None for v in value):
+                cleaned_new_examples[key] = value
+        return cleaned_new_examples
+
+    def _create_loss_mask_without_offsets(self, conversation, input_ids):
+        loss_mask = torch.ones_like(input_ids)
+        text_tokenizer = self.tokenizer.tokenizer
+
+        turns = conversation.split(self.user_header)
+        if len(turns) == 1:
+            parts = turns[0].split(self.assistant_header)
+            instruction_part = parts[0] + self.assistant_header
+            instruction_len = len(text_tokenizer(instruction_part).input_ids)
+            loss_mask[:instruction_len] = 0
+        else:
+            cur_len = 0
+            user_header_len = len(text_tokenizer(self.user_header).input_ids)
+
+            for turn in turns:
+                parts = turn.split(self.assistant_header)
+                instruction_part = parts[0] + self.assistant_header
+                instruction_len = len(text_tokenizer(instruction_part).input_ids)
+                loss_mask[cur_len : cur_len + instruction_len] = 0
+
+                turn_len = len(text_tokenizer(turn).input_ids)
+                cur_len += turn_len
+                cur_len += user_header_len
+                loss_mask[cur_len - user_header_len : cur_len] = 0
+
+        return loss_mask
+
+    def _process_single_conversation(self, conversation_data: List[Dict]) -> Optional[Dict]:
+        if not conversation_data or not isinstance(conversation_data, list):
+            return None
+
+        try:
+            messages = self._build_messages(conversation_data)
+            if not messages:
+                return None
+
+            image_paths = []
+            for message in messages:
+                content = message.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                has_typed_image = any(item.get("type") == "image" for item in content)
+                for item in content:
+                    if item.get("type") == "image" and item.get("image"):
+                        image_paths.append(item["image"])
+                    elif has_typed_image and item.get("type") == "text":
+                        # Legacy LLaVA prompts may include both representations.
+                        item["text"] = item.get("text", "").replace("<image>", "").lstrip()
+
+            for message in messages:
+                if isinstance(message["content"], str):
+                    continue
+                new_content = []
+                for item in message["content"]:
+                    if item["type"] == "image":
+                        new_item = {"type": "image"}
+                    else:
+                        new_item = {"type": item["type"], item["type"]: item[item["type"]]}
+                    new_content.append(new_item)
+                message["content"] = new_content
+
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+
+            if image_paths:
+                encoding = self.tokenizer(
+                    text=[text],
+                    images=[load_image(p) for p in image_paths],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.max_length,
+                )
+                input_ids = encoding["input_ids"]
+                attention_mask = encoding["attention_mask"]
+            else:
+                encoding = self.tokenizer.tokenizer(
+                    text,
+                    return_tensors="pt",
+                    return_offsets_mapping=False,
+                    truncation=True,
+                    max_length=self.max_length,
+                    padding=False,
+                )
+                input_ids = encoding["input_ids"]
+                attention_mask = encoding["attention_mask"]
+            conversation = self.tokenizer.tokenizer.decode(
+                input_ids[0], skip_special_tokens=False
+            )
+            loss_mask = self._create_loss_mask_without_offsets(conversation, input_ids[0]).view(1, -1)
+
+            if self.display and self.display_count == 0:
+                self._visualize_loss_mask(input_ids, loss_mask.view(-1), conversation)
+                self.display_count += 1
+
+            return {
+                "input_ids": input_ids.view(1, -1),
+                "attention_mask": attention_mask.view(1, -1),
+                "loss_mask": loss_mask,
+                "image_paths": json.dumps(image_paths),
+            }
+
+        except Exception as e:
+            rank0_print(f"Error processing conversation: {e}")
+            return None
+
+
 @DatasetBuilderFactory.register("online", "VLM", "hunyuan_vl")
 class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
     def __init__(

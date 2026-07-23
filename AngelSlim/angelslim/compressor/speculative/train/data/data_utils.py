@@ -60,6 +60,10 @@ def build_image_processor_kwargs(image_processor, max_pixels=None, min_pixels=No
         if min_pixels is not None:
             size["shortest_edge"] = min_pixels
         return {"size": size}
+    if "Idefics3" in processor_class:
+        # SmolVLM/Idefics3 does not use the Qwen-style max_pixels/min_pixels
+        # interface here; fall back to the processor defaults.
+        return {}
     else:
         # Qwen2.5-VL's accept max_pixels and min_pixels
         kwargs = {}
@@ -204,18 +208,24 @@ def paddingtensor3D_BCN(tensor_list):
 def paddingtensor3D_BHW(tensor_list):
     if all(tensor is None for tensor in tensor_list):
         return None
-    max_h = max(tensor.shape[-2] for tensor in tensor_list if tensor is not None)
-    max_w = max(tensor.shape[-1] for tensor in tensor_list if tensor is not None)
+    tensors = [
+        tensor.unsqueeze(0) if tensor.ndim == 2 else tensor
+        for tensor in tensor_list
+        if tensor is not None
+    ]
+    max_shape = [
+        max(tensor.shape[dim] for tensor in tensors)
+        for dim in range(1, tensors[0].ndim)
+    ]
     out_tensor_list = []
-    for tensor in tensor_list:
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        b, h, w = tensor.shape
-        outtensor = torch.zeros(b, max_h, max_w, dtype=tensor.dtype)
-        if tensor is not None:
-            outtensor[:, :h, :w] = tensor
+    for tensor in tensors:
+        outtensor = torch.zeros(
+            (tensor.shape[0], *max_shape), dtype=tensor.dtype, device=tensor.device
+        )
+        slices = (slice(None), *(slice(0, size) for size in tensor.shape[1:]))
+        outtensor[slices] = tensor
         out_tensor_list.append(outtensor)
-    return torch.cat(out_tensor_list)
+    return torch.cat(out_tensor_list, dim=0)
 
 
 class DataCollatorWithPadding:
@@ -306,6 +316,7 @@ class VLMDataCollatorWithPadding:
         # Online training: decode image_paths -> pixel_values on-the-fly
         if self.processor is not None and "image_paths" in features[0]:
             all_pixel_values, all_image_grid_thw = [], []
+            all_pixel_attention_masks = []
             all_pixel_values_videos, all_video_grid_thw = [], []
             for item in features:
                 image_paths = json.loads(item["image_paths"])
@@ -324,6 +335,8 @@ class VLMDataCollatorWithPadding:
                             **self._resolved_image_processor_kwargs,
                         )
                     all_pixel_values.append(vision_enc["pixel_values"])
+                    if "pixel_attention_mask" in vision_enc:
+                        all_pixel_attention_masks.append(vision_enc["pixel_attention_mask"])
                     if "image_grid_thw" in vision_enc:
                         all_image_grid_thw.append(vision_enc["image_grid_thw"])
                     if "pixel_values_videos" in vision_enc:
@@ -332,6 +345,8 @@ class VLMDataCollatorWithPadding:
                         all_video_grid_thw.append(vision_enc["video_grid_thw"])
             if all_pixel_values:
                 batch["pixel_values"] = paddingtensor3D_BHW(all_pixel_values)
+            if all_pixel_attention_masks:
+                batch["pixel_attention_mask"] = paddingtensor3D_BHW(all_pixel_attention_masks)
             if all_image_grid_thw:
                 batch["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
             if all_pixel_values_videos:
@@ -342,6 +357,10 @@ class VLMDataCollatorWithPadding:
             if "pixel_values" in features[0]:
                 batch["pixel_values"] = paddingtensor3D_BHW(
                     [item["pixel_values"] for item in features]
+                )
+            if "pixel_attention_mask" in features[0]:
+                batch["pixel_attention_mask"] = paddingtensor3D_BHW(
+                    [item["pixel_attention_mask"] for item in features]
                 )
             if "pixel_values_videos" in features[0]:
                 batch["pixel_values_videos"] = paddingtensor3D_BHW(

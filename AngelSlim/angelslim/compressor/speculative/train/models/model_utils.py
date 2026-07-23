@@ -154,6 +154,11 @@ MODEL_TYPE_PARAM_MAP: dict = {
         "model.embed_tokens.weight",
         "smollm2",
     ),
+    "smolvlm": (
+        "lm_head.weight",
+        "model.text_model.embed_tokens.weight",
+        "smolvlm",
+    ),
     "llama": (
         "lm_head.weight",
         "model.embed_tokens.weight",

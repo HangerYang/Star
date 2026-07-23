@@ -291,6 +291,7 @@ class OfflineLLMDatasetBuilder(DatasetBuilder):
 
 @DatasetBuilderFactory.register("offline", "VLM", "qwen2_5_vl")
 @DatasetBuilderFactory.register("offline", "VLM", "qwen3_vl")
+@DatasetBuilderFactory.register("offline", "VLM", "smolvlm")
 class OfflineVLMDatasetBuilder(DatasetBuilder):
     def __init__(self, file_pattern: str = "*.ckpt", cache_in_memory: bool = False, **kwargs: Any):
         self.file_pattern = file_pattern
