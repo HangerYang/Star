@@ -875,28 +875,40 @@ The full target prefills first (required for verification anyway), so its visual
 
 
 {
-  "architectures": ["Eagle3LlamaForCausalLM"],
+  "architectures": [
+    "Eagle3LlamaForCausalLM"
+  ],
   "model_type": "llama",
+  "target_model_type": "smolvlm",
+  "modal_type": "VLM",
   "torch_dtype": "bfloat16",
   "attention_bias": false,
   "attention_dropout": 0.0,
   "bos_token_id": 1,
   "eos_token_id": 2,
-  "pad_token_id": 2,
+  "head_dim": 64,
   "hidden_act": "silu",
   "hidden_size": 576,
-  "initializer_range": 0.02,
+  "image_token_id": 49190,
+  "initializer_range": 0.041666666666666664,
   "intermediate_size": 1536,
   "max_position_embeddings": 8192,
+  "mlp_bias": false,
   "num_attention_heads": 9,
   "num_hidden_layers": 1,
   "num_key_value_heads": 3,
+  "pad_token_id": 2,
+  "pretraining_tp": 1,
   "rms_norm_eps": 1e-05,
-  "rope_scaling": null,
-  "rope_theta": 100000,
+  "rope_interleaved": false,
+  "rope_parameters": {
+    "rope_theta": 100000,
+    "rope_type": "default"
+  },
   "tie_word_embeddings": true,
+  "transformers_version": "4.51.0",
   "use_cache": true,
-  "vocab_size": 49152,
+  "vocab_size": 49280,
   "draft_vocab_size": 32000
 }
 
