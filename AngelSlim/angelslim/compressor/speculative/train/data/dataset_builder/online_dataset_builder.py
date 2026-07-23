@@ -595,10 +595,19 @@ class OnlineVLMSmolVLMBuilder(OnlineDatasetBuilder):
             image_paths = []
             for message in messages:
                 content = message.get("content", [])
+                if isinstance(content, str):
+                    message["content"] = [{"type": "text", "text": content}]
+                    content = message["content"]
                 if not isinstance(content, list):
                     continue
                 has_typed_image = any(item.get("type") == "image" for item in content)
                 for item in content:
+                    if "image" in item and item["image"] is None:
+                        item.pop("image")
+                    if "text" in item and item["text"] is None:
+                        item.pop("text")
+                    if "video" in item and item["video"] is None:
+                        item.pop("video")
                     if item.get("type") == "image" and item.get("image"):
                         image_paths.append(item["image"])
                     elif has_typed_image and item.get("type") == "text":
@@ -607,9 +616,20 @@ class OnlineVLMSmolVLMBuilder(OnlineDatasetBuilder):
 
             for message in messages:
                 if isinstance(message["content"], str):
-                    continue
+                    message["content"] = [{"type": "text", "text": message["content"]}]
                 new_content = []
                 for item in message["content"]:
+                    item_type = item.get("type")
+                    if item_type == "image":
+                        image_value = item.get("image")
+                        if image_value:
+                            new_content.append({"type": "image", "image": image_value})
+                        continue
+                    if item_type == "text":
+                        text_value = item.get("text", "")
+                        if text_value:
+                            new_content.append({"type": "text", "text": text_value})
+                        continue
                     if item["type"] == "image":
                         new_item = {"type": "image"}
                     else:
