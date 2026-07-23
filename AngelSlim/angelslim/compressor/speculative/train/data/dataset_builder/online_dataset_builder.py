@@ -28,7 +28,6 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 from transformers.image_utils import load_image
-from transformers.pipelines.audio_utils import ffmpeg_read
 
 from angelslim.utils import rank0_print
 
@@ -46,6 +45,13 @@ from ..data_utils import (
 )
 from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
+
+
+def _ffmpeg_read(*args, **kwargs):
+    """Import audio helpers lazily so VLM/LLM registrations do not depend on audio extras."""
+    from transformers.pipelines.audio_utils import ffmpeg_read
+
+    return ffmpeg_read(*args, **kwargs)
 
 
 @DatasetBuilderFactory.register("online", "LLM")
@@ -880,7 +886,7 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
                     if isinstance(item["audio"], str):
                         try:
                             audio_paths.append(
-                                ffmpeg_read(
+                                _ffmpeg_read(
                                     self.read_audio(item["audio"]),
                                     sampling_rate=sampling_rate,
                                 )
