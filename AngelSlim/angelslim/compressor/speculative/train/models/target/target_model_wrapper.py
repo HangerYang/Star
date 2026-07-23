@@ -21,8 +21,6 @@ from huggingface_hub import snapshot_download
 
 from angelslim.utils import decide_device_for_distributed, print_with_rank
 
-from .cosyvoice3_llm import CosyVoice3LM
-
 # ============================================================================
 # Picklable callable classes for vLLM apply_model (TP > 1 compatibility)
 #
@@ -662,7 +660,10 @@ class TransformersBackend(BaseBackend):
         print_with_rank(f"Target model loaded. Actual attn_implementation: {_actual_attn}")
 
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path,
+            trust_remote_code=self.kwargs.get("trust_remote_code", True),
+        )
 
     def _prepare_model_kwargs(self, device: str) -> dict:
         """
@@ -686,7 +687,7 @@ class TransformersBackend(BaseBackend):
         default_kwargs = {
             "torch_dtype": torch.bfloat16,
             "device_map": device,
-            "trust_remote_code": True,
+            "trust_remote_code": self.kwargs.get("trust_remote_code", True),
             "attn_implementation": attn_implementation,
         }
         # Only pass through kwargs that are valid for from_pretrained;
@@ -818,7 +819,7 @@ class TransformersBackend(BaseBackend):
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
-    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl"]
+    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl", "smolvlm"]
 
     def load_model(self):
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -840,7 +841,7 @@ class VLMTransformersBackend(BaseBackend):
 
             # Load processor
             self.tokenizer = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl", "smolvlm"):
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -884,6 +885,48 @@ class VLMTransformersBackend(BaseBackend):
         default_kwargs.update(self.kwargs)
         return default_kwargs
 
+    def _get_language_model_module(self):
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+            return self.model.model.language_model
+        if self.target_model_type == "smolvlm":
+            return self.model.model.text_model
+        if self.target_model_type == "hunyuan_vl":
+            return self.model.model
+        raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
+    def _prepare_forward_kwargs(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        **kwargs,
+    ) -> dict:
+        model_kwargs = {
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "output_logits": True,
+        }
+
+        input_position_ids = kwargs.get("input_position_ids", None)
+        if input_position_ids is not None:
+            model_kwargs["position_ids"] = input_position_ids
+
+        pixel_values = kwargs.get("pixel_values", None)
+        if pixel_values is not None:
+            if self.target_model_type != "smolvlm":
+                pixel_values = pixel_values.squeeze(0)
+            model_kwargs["pixel_values"] = pixel_values
+
+        pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+        if pixel_attention_mask is not None:
+            if self.target_model_type != "smolvlm":
+                pixel_attention_mask = pixel_attention_mask.squeeze(0)
+            model_kwargs["pixel_attention_mask"] = pixel_attention_mask
+
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        if image_grid_thw is not None and self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+            model_kwargs["image_grid_thw"] = image_grid_thw
+
+        return model_kwargs
+
     def get_hidden_states_and_logits(
         self,
         input_ids: torch.Tensor,
@@ -910,29 +953,11 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
-            handle = self.model.model.language_model.register_forward_pre_hook(
-                hook, with_kwargs=True
-            )
-        elif self.target_model_type == "hunyuan_vl":
-            handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
-        else:
-            raise ValueError(f"Unsupported target model type: {self.target_model_type}")
-        pixel_values = kwargs.get("pixel_values", None)
-        if pixel_values is not None:
-            pixel_values = pixel_values.squeeze(0)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        input_position_ids = kwargs.get("input_position_ids", None)
+        handle = self._get_language_model_module().register_forward_pre_hook(
+            hook, with_kwargs=True
+        )
         with torch.no_grad():
-            outputs = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=input_position_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                output_hidden_states=True,
-                output_logits=True,
-            )
+            outputs = self.model(input_ids, **self._prepare_forward_kwargs(attention_mask, **kwargs))
 
         handle.remove()
         inputs_embeds = inputs_embeds_list[0].to(input_ids.device) if inputs_embeds_list else None
@@ -982,30 +1007,11 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
-            handle = self.model.model.language_model.register_forward_pre_hook(
-                hook, with_kwargs=True
-            )
-        elif self.target_model_type == "hunyuan_vl":
-            handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
-        else:
-            raise ValueError(f"Unsupported target model type: {self.target_model_type}")
-
-        pixel_values = kwargs.get("pixel_values", None)
-        if pixel_values is not None:
-            pixel_values = pixel_values.squeeze(0)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        input_position_ids = kwargs.get("input_position_ids", None)
+        handle = self._get_language_model_module().register_forward_pre_hook(
+            hook, with_kwargs=True
+        )
         with torch.no_grad():
-            outputs = self.model(
-                input_ids,
-                pixel_values=pixel_values,
-                position_ids=input_position_ids,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                output_logits=True,
-            )
+            outputs = self.model(input_ids, **self._prepare_forward_kwargs(attention_mask, **kwargs))
 
         handle.remove()
         inputs_embeds = inputs_embeds_list[0].to(input_ids.device) if inputs_embeds_list else None
@@ -1998,6 +2004,7 @@ class TTSTransformersBackend(TransformersBackend):
 
     def _load_cosyvoice3(self) -> None:
         """Load text tokenizer using HuggingFace Transformers."""
+        from .cosyvoice3_llm import CosyVoice3LM
 
         self.model = CosyVoice3LM(
             self.model_path,

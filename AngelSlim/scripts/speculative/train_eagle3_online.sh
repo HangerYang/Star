@@ -36,6 +36,10 @@ export MASTER_PORT=${MASTER_PORT:-$((20000 + RANDOM % 10000))}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-/tmp/torch_extensions}
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 
+export MODAL_TYPE=${MODAL_TYPE:-$(
+    "$PYTHON_BIN" -c "import json, os; print(json.load(open(os.environ['DRAFT_MODEL_CONFIG_PATH'])).get('modal_type', 'LLM'))"
+)}
+
 if [[ ! -d "$TARGET_MODEL_NAME_OR_PATH" ]]; then
     export TARGET_MODEL_NAME_OR_PATH=$(
         "$PYTHON_BIN" -c "import os; from huggingface_hub import snapshot_download; print(snapshot_download(repo_id=os.environ['TARGET_MODEL_NAME_OR_PATH'], resume_download=True))"
@@ -43,6 +47,7 @@ if [[ ! -d "$TARGET_MODEL_NAME_OR_PATH" ]]; then
 fi
 
 "$TORCHRUN_BIN" --master_port "$MASTER_PORT" --nproc_per_node=8 tools/train_eagle3_online.py \
+    --modal_type $MODAL_TYPE \
     --target_model_name_or_path $TARGET_MODEL_NAME_OR_PATH \
     --draft_model_config_path $DRAFT_MODEL_CONFIG_PATH \
     --train_data_path $TRAIN_DATA_PATH \
