@@ -874,87 +874,26 @@ The full target prefills first (required for verification anyway), so its visual
 **Evaluation plan.** Metrics: acceptance length τ, relative drafter cost c, wall-clock speedup, drafter memory overhead, per-token-type acceptance (visual-grounded vs. function tokens, MSD diagnostic). Baselines: EAGLE-2/3, ViSpec, HiViS (trained); CLaSp/LEAP (training-free floor); MASSV (independent small drafter). Targets: one LLaVA-family and one Qwen-VL-family model.
 
 
-Segfaults in this script are almost always **native** (CUDA / FA2 / NCCL / fork+CUDA), not a Python traceback. Bisect like this on the other server.
 
-### 1. Capture *when* it dies
-```bash
-# see last Python lines before death
-CUDA_VISIBLE_DEVICES=0 NPROC=1 \
-  bash -x scripts/speculative/smolvlm/train_eagle3_vlm_online.sh 2>&1 | tee train_segfault.log
-```
-Note the stage: import → model load → dataset `map` → first train step → DeepSpeed init.
 
-Also:
-```bash
-dmesg -T | tail -50    # GPU Xid / OOM killer
-```
-
-### 2. Minimal single-process smoke (most important)
-Force the safest path:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 NPROC=1 \
-SAMPLE_NUM=2 \
-MODEL_MAX_LENGTH=512 \
-NUM_TRAIN_EPOCHS=1 \
-LOAD_FROM_CACHE_FILE=false \
-DEEPSPEED_CONFIG= \
-bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
-```
-
-If this works, scale up one knob at a time (`SAMPLE_NUM`, length, `NPROC`).
-
-### 3. Common culprits for *this* train path
-
-| Suspect | What to try |
-|---|---|
-| **FlashAttention-2** | Load target with SDPA/eager if your env sets FA2 (mismatched CUDA/torch/flash-attn → classic segfault). |
-| **Dataset workers / fork** | Script uses `--num_proc 4` for HF `map`. Temporarily patch/override to `1`, or set `LOAD_FROM_CACHE_FILE=true` after one successful preprocess. Also try `OMP_NUM_THREADS=1`. |
-| **Multi-GPU / NCCL** | Keep `NPROC=1` until stable. Then `NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NPROC=2`. |
-| **DeepSpeed** | Leave `DEEPSPEED_CONFIG` empty until single-GPU works. |
-| **Long VL sequences / OOM→fault** | Lower `MODEL_MAX_LENGTH` (512/1024). Check `nvidia-smi` during crash. |
-| **Bad image / PIL / decoder** | Run on **text-only** jsonl first (`data_0-36` style). If OK, fault is in vision/pixels path. |
-
-### 4. Isolate target vs draft
-If smoke still dies, run a tiny Python repro on that server:
-
-```bash
-python - <<'PY'
-import torch
-from transformers import AutoModelForImageTextToText, AutoProcessor
-m = AutoModelForImageTextToText.from_pretrained(
-    "HuggingFaceTB/SmolVLM-256M-Instruct",
-    torch_dtype=torch.bfloat16,
-    attn_implementation="sdpa",  # then try flash_attention_2
-).cuda().eval()
-print("loaded", torch.cuda.memory_allocated())
-# optional: one forward on a short text-only batch
-PY
-```
-
-- Dies at **FA2 load/forward** → attention/CUDA stack.  
-- Dies only in **full train** → draft/`torchrun`/collator/pixels.
-
-### 5. Native backtrace (if it dies inside C++)
-```bash
-CUDA_VISIBLE_DEVICES=0 NPROC=1 \
-  gdb -ex run -ex bt --args \
-  python -m torch.distributed.run --nproc_per_node=1 \
-  tools/train_eagle3_online.py ...same args as the script...
-```
-Or: `CUDA_LAUNCH_BLOCKING=1` (slower, sometimes turns silent GPU faults into clearer errors — not always for true segfaults).
-
-### 6. Env checklist on the other server
-```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
-python -c "import transformers; print(transformers.__version__)"
-python -c "import flash_attn; print(flash_attn.__version__)"  # may fail = OK
-nvidia-smi
-```
-Mismatch: new torch + old `flash-attn`, or CUDA toolkit ≠ driver.
-
----
-
-**Practical order:** `NPROC=1` + short data + SDPA + no DeepSpeed → if green, add FA2 → add length → add images → add multi-GPU.
-
-If you paste the **last ~30 log lines** before the segfault (and whether `NPROC`/FA2/DeepSpeed were on), we can narrow it to one of the rows above quickly.
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=. \
+python tools/train_eagle3_online.py \
+  --modal_type VLM \
+  --target_model_name_or_path HuggingFaceTB/SmolVLM-256M-Instruct \
+  --draft_model_config_path angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3.json \
+  --train_data_path dataset/smolvlm_256m_target_gen/data_0-36.jsonl \
+  --output_dir /tmp/smolvlm_smoke \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --num_proc 1 \
+  --load_from_cache_file false \
+  --sample_num 2 \
+  --model_max_length 512 \
+  --embed_weight_key model.text_model.embed_tokens.weight \
+  --chat_template_type smolvlm \
+  --bf16 \
+  --report_to none \
+  --logging_steps 1 \
+  --save_strategy no
