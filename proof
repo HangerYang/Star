@@ -1,28 +1,16 @@
-**Setup:** Draft samples x ~ q(x). Accept with probability min(1, p(x)/q(x)). If rejected, resample from the residual p'(x) = max(0, p(x)−q(x)) / Z, where Z = Σₓ max(0, p(x)−q(x)).
+| Model | textvqa | MMMU | MMStar | MATH-500 | COCO-Caption |
+|---|---:|---:|---:|---:|---:|
+| Regular 1-layer EAGLE | 2.0281 | 2.3576 | 2.0480 | 3.0704 | 2.3312 |
+| Hawk nccl | 1.8856 | 2.3111 | 1.9509 | 3.1189 | 2.2009 |
+| Hawk nccl miracle | 1.8816 | 2.3290 | 2.0453 | 3.1573 | - |
+| Hawk warmup miracle | 1.9664 | 2.4071 | 1.6609 | 3.2517 | 1.9650 |
+| Progressive EAGLE | 2.0149 | 2.5356 | 2.0390 | 3.4452 | 2.3850 |
+| Hawk feature-match | 1.9926 | 2.4576 | 1.8320 | 3.3354 | 2.3739 |
 
----
 
-**Step 1 — Probability of proposing x *and* accepting it:**
-$$P(\text{propose }x,\text{ accept}) = q(x)\cdot\min\left(1,\frac{p(x)}{q(x)}\right) = \min(p(x),q(x))$$
-*(Intuition: you can never "accept" more of x than the smaller of what p wants and what q offers — that's the ceiling.)*
 
-**Step 2 — Total accept/reject probability, summed over the whole vocabulary:**
-$$P(\text{accept}) = \sum_x \min(p(x),q(x)), \qquad P(\text{reject}) = 1-\sum_x \min(p(x),q(x))$$
-*(Just adding Step 1's per-token result across every token to get one overall number.)*
+1. Fixed NCCL works, but its acceptance is lower than the earlier DP/ZeRO3-style runs.
 
-**Step 3 — Show the residual's normalizer Z equals P(reject):**
-$$Z=\sum_x\max(0,p(x)-q(x))=\sum_x\big(p(x)-\min(p(x),q(x))\big)=1-\sum_x\min(p(x),q(x))=P(\text{reject})$$
-*(Intuition: "total leftover mass p has that q didn't cover" and "how often we reject" are the same shortfall, just measured two different ways — so they're forced to be numerically equal.)*
+2. Hawk under miracle/GT hidden-state condition does not show a huge consistent gain. 
 
-**Step 4 — Total probability of ending on token x** (via acceptance OR via reject-then-resample):
-$$P(\text{final}=x)=\min(p(x),q(x))+P(\text{reject})\cdot p'(x)=\min(p(x),q(x))+Z\cdot\frac{\max(0,p(x)-q(x))}{Z}$$
-$$=\min(p(x),q(x))+\max(0,p(x)-q(x))$$
-*(The Z's cancel — numerator and denominator — because of Step 3's identity. That cancellation is the crux of the whole proof.)*
-
-**Step 5 — Case check, to confirm it collapses to p(x) either way:**
-- If p(x) ≥ q(x): min(·) = q(x), max(·) = p(x)−q(x) → sum = q(x)+p(x)−q(x) = p(x) ✓
-- If p(x) < q(x): min(·) = p(x), max(·) = 0 → sum = p(x)+0 = p(x) ✓
-
-$$\boxed{P(\text{final}=x)=p(x)\quad\forall x}$$ ∎
-
-**One-line takeaway:** the accept-step contributes the "overlap" between p and q, the resample-step contributes exactly the "gap" p has beyond q, and by Step 3 those two pieces are *guaranteed* to add back up to p — no matter how different p and q are.
+3. Progressive EAGLE gives the most consistent improvement overall.
