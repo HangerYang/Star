@@ -1,16 +1,66 @@
-| Model | textvqa | MMMU | MMStar | MATH-500 | COCO-Caption |
-|---|---:|---:|---:|---:|---:|
-| Regular 1-layer EAGLE | 2.0281 | 2.3576 | 2.0480 | 3.0704 | 2.3312 |
-| Hawk nccl | 1.8856 | 2.3111 | 1.9509 | 3.1189 | 2.2009 |
-| Hawk nccl miracle | 1.8816 | 2.3290 | 2.0453 | 3.1573 | - |
-| Hawk warmup miracle | 1.9664 | 2.4071 | 1.6609 | 3.2517 | 1.9650 |
-| Progressive EAGLE | 2.0149 | 2.5356 | 2.0390 | 3.4452 | 2.3850 |
-| Hawk feature-match | 1.9926 | 2.4576 | 1.8320 | 3.3354 | 2.3739 |
+**Entropy** = how spread-out the image-key attention is (normalized 0–1). **Lower = more peaked** on a few image tokens. **Higher = closer to uniform.**
 
+Ranked **lowest entropy first** (500 image-only samples):
 
+| Rank | Layer | Mass | Entropy |
+|---:|---:|---:|---:|
+| 1 | 15 | 0.143 | 0.557 |
+| 2 | 26 | 0.040 | 0.560 |
+| 3 | 22 | 0.117 | 0.571 |
+| 4 | 23 | 0.136 | 0.594 |
+| 5 | 27 | 0.062 | 0.596 |
+| 6 | 21 | 0.174 | 0.607 |
+| 7 | 8 | 0.113 | 0.611 |
+| 8 | 13 | 0.028 | 0.612 |
+| 9 | 18 | 0.040 | 0.614 |
+| 10 | 25 | 0.031 | 0.617 |
+| 11 | 24 | 0.081 | 0.627 |
+| 12 | 9 | 0.066 | 0.627 |
+| 13 | 14 | 0.065 | 0.633 |
+| 14 | 28 | 0.089 | 0.638 |
+| 15 | 20 | 0.037 | 0.649 |
+| 16 | 4 | 0.055 | 0.660 |
+| 17 | 17 | 0.091 | 0.662 |
+| 18 | 19 | 0.026 | 0.669 |
+| 19 | 16 | 0.026 | 0.687 |
+| 20 | 10 | 0.030 | 0.704 |
+| 21 | 3 | 0.030 | 0.705 |
+| 22 | 12 | 0.038 | 0.709 |
+| 23 | 29 | 0.109 | 0.725 |
+| 24 | 6 | 0.042 | 0.733 |
+| 25 | 5 | 0.050 | 0.750 |
+| 26 | 7 | 0.029 | 0.756 |
+| 27 | 2 | 0.049 | 0.759 |
+| 28 | 11 | 0.039 | 0.808 |
+| 29 | 1 | 0.102 | 0.817 |
+| 30 | 0 | 0.317 | 0.963 |
 
-1. Fixed NCCL works, but its acceptance is lower than the earlier DP/ZeRO3-style runs.
+**1. 40k MAL** (temp 0, ckpt-40000)
 
-2. Hawk under miracle/GT hidden-state condition does not show a huge consistent gain. 
+| Benchmark | 1-15-23 | 15-23-27 | prog eagle | Best |
+|---|---:|---:|---:|---|
+| textvqa | 1.9014 | 1.8569 | 1.8575 | 1-15-23 |
+| MMMU | 2.3829 | 2.2484 | 2.2268 | 1-15-23 |
+| MMStar | 2.0000 | 1.8374 | 1.7071 | 1-15-23 |
+| MATH-500 | 3.1482 | 2.6191 | 3.0114 | 1-15-23 |
+| COCO-Caption | 2.1997 | 2.1945 | 2.1833 | 1-15-23 |
+| **Macro** | **2.3264** | 2.1513 | 2.1972 | **1-15-23** |
 
-3. Progressive EAGLE gives the most consistent improvement overall.
+**2. 66k MAL** — w=0.1 vs w=0.3 vs prog eagle 1-15-23 (temp 0, ckpt-66466)
+
+| Benchmark | prog eagle | w=0.1 | w=0.3 | Best |
+|---|---:|---:|---:|---|
+| textvqa | 2.0177 | 2.0236 | 2.0463 | w=0.3 |
+| MMMU | 2.5381 | 2.4927 | 2.4670 | prog eagle |
+| MMStar | 2.0929 | 2.2085 | 2.0576 | w=0.1 |
+| MATH-500 | 3.3849 | 3.4036 | 3.4229 | w=0.3 |
+| COCO-Caption | 2.3411 | 2.3216 | 2.3237 | prog eagle |
+| **Macro** | 2.4749 | **2.4900** | 2.4635 | **w=0.1** |
+
+**3. Draft mass / entropy** (500 image-only, ckpt-66466). H = entropy, lower = more peaked.
+
+| Layer | Target | Prog mass | w0.1 mass | w0.3 mass | T mass | Prog H | w0.1 H | w0.3 H | T H |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| L0 | T1 | 0.036 | 0.067 | 0.089 | 0.102 | 0.878 | 0.930 | 0.942 | 0.817 |
+| L1 | T15 | 0.015 | 0.074 | 0.072 | 0.143 | 0.718 | 0.622 | 0.622 | 0.557 |
+| L2 | T23 | 0.094 | 0.172 | 0.196 | 0.136 | 0.640 | 0.611 | 0.618 | 0.594 |
