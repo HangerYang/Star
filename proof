@@ -1,104 +1,31 @@
-# SmolVLM EAGLE-3: H_full @ layer 0 vs 1-layer baseline
+# SmolVLM-256M speculative decoding — acceptance length and output throughput
 
-Both run **exactly one draft layer**, isolating draft-step cost against acceptance quality.
+80 prompts, K=4 draft tokens, batch size 1. M1 = worst case (shortest acceptance, lowest tok/s) across its two runs.
 
-- 80 prompts, `OUTPUT_LEN=1024`, `max_num_seqs=1`, `num_spec_tokens=4`, eager
-- H_full: `~/tmp/bridge_ablation/H_full/checkpoint-66466` + `EAGLE3_FORCE_EXIT_LAYER=0`
-- M1: `output/smolvlm_256m_eagle3_nccl/checkpoint-66466`
+## Temperature 0
 
-Speedup is **ms per output token**, not wall time: at temp 1 the runs sample different
-text and stop at different lengths, so wall time compares unequal work. ms/token is
-equivalent to truncating both to the same token count.
+| Benchmark | H_full accept | M1 accept | fc accept | H_full tok/s | M1 tok/s | fc tok/s |
+|---|---|---|---|---|---|---|
+| ChartQA | 2.083 | 2.012 | 2.369 | 228.7 | 217.8 | 211.0 |
+| COCO-Caption | 2.307 | 2.331 | 2.567 | 302.6 | 314.9 | 278.7 |
+| MATH-500 | 3.256 | 3.070 | 3.523 | 444.7 | 426.7 | 397.7 |
+| MathVista | 1.676 | 1.672 | 1.939 | 65.3 | 65.1 | 61.4 |
+| MMMU | 2.547 | 2.358 | 2.643 | 209.8 | 208.7 | 189.5 |
+| MMStar | 2.212 | 2.048 | 2.263 | 52.3 | 52.7 | 53.1 |
+| OmniDocBench | 2.635 | 2.234 | 2.516 | 343.3 | 303.4 | 273.9 |
+| TextVQA | 1.983 | 2.028 | 2.170 | 118.6 | 114.1 | 107.3 |
 
-## temp 0
+## Temperature 1 (per-layer-fc not evaluated)
 
-**Acceptance length**
-
-| run | textvqa | MMMU | MMStar | OmniDocBench | MATH-500 | COCO-Caption | chartqa | mathvista | mean |
-|---|---|---|---|---|---|---|---|---|---|
-| eagle3 nccl (1 layer) — baseline | 2.028 | 2.358 | 2.048 | 2.234 | 3.070 | 2.331 | 2.012 | 1.672 | **2.219** |
-| H_full @ layer 0 (no check) | 1.983 | 2.547 | 2.212 | 2.635 | 3.256 | 2.307 | 2.083 | 1.676 | **2.337** |
-| per_layer_fc_3.1 (3 layers, full depth) | 2.170 | 2.643 | 2.263 | 2.237 | 3.523 | 2.567 | 2.369 | 1.939 | **2.464** |
-
-**Total time (s)**
-
-| run | textvqa | MMMU | MMStar | OmniDocBench | MATH-500 | COCO-Caption | chartqa | mathvista |
-|---|---|---|---|---|---|---|---|---|
-| eagle3 nccl (1 layer) — baseline | 11.26 | 17.27 | 13.42 | 110.31 | 106.24 | 125.78 | 30.07 | 14.01 |
-| H_full @ layer 0 (no check) | 11.57 | 17.18 | 13.51 | 97.26 | 101.93 | 130.40 | 31.07 | 13.96 |
-| per_layer_fc_3.1 (3 layers, full depth) | 12.78 | 19.01 | 13.32 | 39.31 | 113.97 | 143.09 | 38.19 | 14.85 |
-| **speedup vs baseline (ms/token)** | 0.974x | 1.005x | 0.993x | 1.132x | 1.042x | 0.961x | 1.013x | 1.003x |
-
-Geometric mean speedup: **1.014x**
-
-
-## temp 1
-
-**Acceptance length**
-
-| run | textvqa | MMMU | MMStar | MATH-500 | mean |
-|---|---|---|---|---|---|
-| eagle3 nccl (1 layer) — baseline | 1.720 | 1.446 | 1.790 | 1.490 | **1.612** |
-| H_full @ layer 0 (no check) | 1.569 | 1.404 | 1.791 | 1.519 | **1.571** |
-
-**Total time (s)**
-
-| run | textvqa | MMMU | MMStar | MATH-500 |
+| Benchmark | H_full accept | M1 accept | H_full tok/s | M1 tok/s |
 |---|---|---|---|---|
-| eagle3 nccl (1 layer) — baseline | 10.22 | 15.28 | 13.33 | 100.41 |
-| H_full @ layer 0 (no check) | 12.17 | 16.95 | 13.33 | 91.13 |
-| **speedup vs baseline (ms/token)** | 1.099x | 1.053x | 1.028x | 0.985x |
+| ChartQA | 1.245 | 1.246 | 148.2 | 148.9 |
+| COCO-Caption | 1.417 | 1.420 | 189.4 | 195.9 |
+| MATH-500 | 1.519 | 1.490 | 207.7 | 210.9 |
+| MathVista | 1.473 | 1.494 | 57.4 | 56.3 |
+| MMMU | 1.404 | 1.446 | 112.1 | 106.4 |
+| MMStar | 1.791 | 1.790 | 66.2 | 64.4 |
+| OmniDocBench | 1.175 | 1.189 | 153.3 | 157.8 |
+| TextVQA | 1.569 | 1.720 | 103.9 | 92.2 |
 
-Geometric mean speedup: **1.040x**
-
-
-## Where the time goes (MATH-500, temp 0, 80 prompts)
-
-Both runs emit identical output (566.6 tok/sample), so this divides
-cleanly. One draft round = 1 target verification + 4 draft steps.
-
-| | M1 | H_full |
-|---|---|---|
-| draft rounds | 14767 | 13923 |
-| rounds per sample | 184.6 | 174.0 |
-| ms per round | 7.195 | 7.321 |
-
-- **Rounds saved:** 844 total, 10.55/sample → **6.07 s** (75.9 ms/sample)
-- **Heavier step:** +0.126 ms/round over 13923 rounds → **1.76 s** (22.0 ms/sample)
-- **Net:** +4.31 s
-
-The net is an algebraic identity with the observed difference, not independent
-confirmation. The real measurements are the 844 saved rounds and the components below.
-
-### Why H_full's step is heavier
-
-Benchmarked directly on both checkpoints (batch 1, bf16, H200):
-
-| component | per call | calls | total |
-|---|---|---|---|
-| `combine_hidden_states`: 3 `fc_norm` + 3 projections vs M1's single `fc` | +121 us | 13923 rounds | 1.68 s |
-| seed `norm` per draft step (`norm_output: true`; M1 false) | ~30 us | 55692 steps | 1.67 s |
-
-`combine_hidden_states` is flat in N (11.8 us vs 132.8 us at N=1 and N=1000) — launch
-bound, not FLOP bound. Both are architectural, not waste; removing either needs retraining.
-
-## Cost of the confidence check
-
-Same config, layer-0 exit decided by the check (threshold 1e-6) instead of forced.
-MATH-500, 40 prompts: **44.78 s → 47.92 s (+7.0%)** = 527 us/round = **~132 us per check**.
-Standalone isolation: ~106 us (63 us `lm_head` over 32000 + fp32 softmax, 43 us
-`.min().item()` host sync). The check costs more than H_full's entire acceptance advantage.
-
-## Optimisations applied (vLLM eval path)
-
-All verified output-neutral — accepted/drafted counts unchanged:
-
-1. **Scatter-free confidence logits** — the check allocated an `[N, 49280]` `-inf` tensor
-   and scattered 32000 draft logits in; max softmax probability is identical without it.
-2. **Exit-logit reuse** — on exit the final hidden state *is* the exiting layer's output,
-   already through `lm_head` by the check.
-3. **Lazy `_aux_inject`** — at a layer-0 exit nothing reads the injects, so the tape build
-   and projection are dead work. Deferred to first read.
-4. **Check-free forced exit** (`EAGLE3_FORCE_EXIT_LAYER=0`) — no `lm_head`, no host sync.
-
-Cumulative on MATH-500 (40 prompts): 49.12 s → 44.78 s, with M1 at 45.84 s.
+Note: per-layer-fc OmniDocBench (temp 0) is a rerun; the stored run reported 806.2 tok/s but emitted only 396.2 output tokens/sample vs 417.3 for the others.
