@@ -1,6 +1,6 @@
 # One-layer drafts — 8 benchmarks, GPU 0 sequential
 
-Generated 2026-08-21T10:00:40-07:00.
+Generated 2026-08-21T10:51:47-07:00.
 
 Every 1-layer draft plus the non-speculative target, over 8 benchmarks.
 One vLLM job at a time on GPU 0 with nothing else on the box, so tok/s is
@@ -75,8 +75,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 2.373 | 2.484 | 2.594 | 3.070 | 2.515 | 2.043 | 2.531 | 2.454 | **2.508** |
 | `banded_mix_fc_3.1` | 2.626 | 2.656 | 2.809 | 3.532 | 2.700 | 2.214 | 2.576 | 2.535 | **2.706** |
 | `banded_mix_wide_3.1` | 2.525 | 2.637 | 2.813 | 3.379 | 2.752 | 2.176 | 2.742 | 2.536 | **2.695** |
-| `branch_distill_top1_w01` | — | — | — | 3.488 | — | — | — | — | **3.488** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
+| `branch_distill_top1_w01` | 2.503 | 2.673 | 2.799 | 3.488 | 2.716 | 2.205 | 2.694 | 2.480 | **2.695** |
+| `vistoken_k1` | 2.363 | 2.439 | 2.707 | 3.477 | 2.429 | 2.236 | 2.567 | 2.236 | **2.557** |
 
 ### Throughput (tok/s)
 
@@ -86,8 +86,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 254.3 | 324.5 | 361.2 | 424.9 | 292.0 | 246.3 | 283.9 | 334.1 | **315.2** |
 | `banded_mix_fc_3.1` | 279.5 | 332.4 | 370.9 | 475.2 | 295.3 | 257.4 | 268.5 | 335.2 | **326.8** |
 | `banded_mix_wide_3.1` | 259.5 | 324.9 | 367.4 | 449.1 | 302.4 | 252.1 | 282.3 | 330.2 | **321.0** |
-| `branch_distill_top1_w01` | — | — | — | 470.7 | — | — | — | — | **470.7** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
+| `branch_distill_top1_w01` | 258.1 | 338.6 | 373.0 | 470.7 | 305.4 | 253.7 | 285.1 | 331.4 | **327.0** |
+| `vistoken_k1` | 240.9 | 300.9 | 344.2 | 473.3 | 265.1 | 245.2 | 260.7 | 289.9 | **302.5** |
 
 ### Speedup vs `no_eagle_baseline`
 
@@ -96,10 +96,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 1.408x | 1.628x | 1.742x | 2.044x | 1.568x | 1.328x | 1.575x | 1.624x | **1.615x** |
 | `banded_mix_fc_3.1` | 1.548x | 1.667x | 1.789x | 2.286x | 1.586x | 1.388x | 1.489x | 1.629x | **1.673x** |
 | `banded_mix_wide_3.1` | 1.437x | 1.630x | 1.772x | 2.160x | 1.624x | 1.359x | 1.566x | 1.605x | **1.644x** |
-| `branch_distill_top1_w01` | — | — | — | 2.264x | — | — | — | — | **2.264x** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
-
-> **15 of 48 cells missing** (sweep in flight or failed): `branch_distill_top1_w01 MMStar`, `branch_distill_top1_w01 MMMU`, `branch_distill_top1_w01 OmniDocBench`, `branch_distill_top1_w01 textvqa`, `branch_distill_top1_w01 chartqa`, `branch_distill_top1_w01 mathvista`, `branch_distill_top1_w01 COCO-Caption`, `vistoken_k1 MMStar`, `vistoken_k1 MMMU`, `vistoken_k1 OmniDocBench`, `vistoken_k1 MATH-500`, `vistoken_k1 textvqa` ….
+| `branch_distill_top1_w01` | 1.429x | 1.698x | 1.799x | 2.264x | 1.640x | 1.368x | 1.582x | 1.611x | **1.674x** |
+| `vistoken_k1` | 1.334x | 1.509x | 1.660x | 2.277x | 1.424x | 1.322x | 1.446x | 1.409x | **1.548x** |
 
 ## Results — temp 1
 
@@ -110,8 +108,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 1.478 | 1.335 | 1.302 | 1.490 | 1.379 | 1.245 | 1.496 | 1.424 | **1.394** |
 | `banded_mix_fc_3.1` | 1.553 | 1.368 | 1.296 | 1.630 | 1.430 | 1.245 | 1.481 | 1.433 | **1.429** |
 | `banded_mix_wide_3.1` | 1.554 | 1.356 | 1.308 | 1.594 | 1.390 | 1.240 | 1.562 | 1.429 | **1.429** |
-| `branch_distill_top1_w01` | — | — | 1.355 | 1.579 | — | — | — | — | **1.467** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
+| `branch_distill_top1_w01` | 1.474 | 1.430 | 1.355 | 1.579 | 1.403 | 1.247 | 1.552 | 1.431 | **1.434** |
+| `vistoken_k1` | 1.504 | 1.313 | 1.263 | 1.583 | 1.353 | 1.259 | 1.457 | 1.364 | **1.387** |
 
 ### Throughput (tok/s)
 
@@ -121,8 +119,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 163.7 | 178.7 | 176.8 | 209.5 | 174.8 | 160.0 | 179.6 | 196.3 | **179.9** |
 | `banded_mix_fc_3.1` | 156.1 | 175.3 | 174.5 | 221.5 | 178.4 | 156.3 | 167.9 | 195.9 | **178.2** |
 | `banded_mix_wide_3.1` | 156.6 | 173.8 | 170.5 | 210.4 | 167.2 | 155.2 | 178.3 | 192.1 | **175.5** |
-| `branch_distill_top1_w01` | — | — | 179.6 | 216.8 | — | — | — | — | **198.2** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
+| `branch_distill_top1_w01` | 151.3 | 184.3 | 179.6 | 216.8 | 173.8 | 158.3 | 168.8 | 191.1 | **178.0** |
+| `vistoken_k1` | 137.9 | 156.9 | 157.9 | 214.8 | 160.8 | 145.0 | 165.2 | 174.9 | **164.2** |
 
 ### Speedup vs `no_eagle_baseline`
 
@@ -131,10 +129,8 @@ itself is unchanged. How each benchmark is treated:
 | `baseline_1layer` | 0.954x | 0.906x | 0.880x | 1.007x | 0.896x | 0.844x | 1.042x | 0.957x | **0.936x** |
 | `banded_mix_fc_3.1` | 0.910x | 0.888x | 0.869x | 1.064x | 0.915x | 0.825x | 0.974x | 0.955x | **0.925x** |
 | `banded_mix_wide_3.1` | 0.913x | 0.881x | 0.849x | 1.011x | 0.858x | 0.819x | 1.034x | 0.937x | **0.913x** |
-| `branch_distill_top1_w01` | — | — | 0.894x | 1.041x | — | — | — | — | **0.968x** |
-| `vistoken_k1` | — | — | — | — | — | — | — | — | — |
-
-> **14 of 48 cells missing** (sweep in flight or failed): `branch_distill_top1_w01 MMStar`, `branch_distill_top1_w01 MMMU`, `branch_distill_top1_w01 textvqa`, `branch_distill_top1_w01 chartqa`, `branch_distill_top1_w01 mathvista`, `branch_distill_top1_w01 COCO-Caption`, `vistoken_k1 MMStar`, `vistoken_k1 MMMU`, `vistoken_k1 OmniDocBench`, `vistoken_k1 MATH-500`, `vistoken_k1 textvqa`, `vistoken_k1 chartqa` ….
+| `branch_distill_top1_w01` | 0.882x | 0.934x | 0.894x | 1.041x | 0.891x | 0.836x | 0.979x | 0.932x | **0.924x** |
+| `vistoken_k1` | 0.804x | 0.795x | 0.786x | 1.032x | 0.825x | 0.765x | 0.958x | 0.853x | **0.852x** |
 
 ## Prompt / output sizes
 
