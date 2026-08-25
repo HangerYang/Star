@@ -137,3 +137,34 @@ Centering removes arbitrary constant offsets that do not affect softmax probabil
 Centering removes arbitrary constant offsets that do not affect softmax probabilities. This prevents the loss from penalizing differences that have no effect on the models’ predictions.
 
 Matching the shift, rather than the full substituted output, cancels the baseline logits that are similar across the original and substituted contexts and isolates the change caused by the substituted token. This focuses the loss on how the candidate probabilities should move, instead of repeating the distribution-matching supervision already provided by the standard loss.
+
+Problem
+
+EAGLE-3 conditions the draft model on hidden states from three manually selected target layers, representing the early, middle, and late regions of the network. Each selected layer serves as the sole representative of its region, leaving complementary information from neighboring layers unused. The quality of the resulting conditioning feature therefore depends on a fixed, hand-designed layer choice.
+
+Novelty: Layer-Band Fusion
+
+We introduce Layer-Band Fusion, which replaces each manually selected layer with a learned mixture of layers from the same depth band. This allows the draft to use information distributed across several target layers while preserving the separation between early, middle, and late representations. The fused feature has the same dimension as the original EAGLE-3 conditioning input.
+
+Method
+
+Band construction. We divide the target layers into three depth bands: B_early, B_middle, and B_late.
+
+Within-band mixing. For each band b ∈ {early, middle, late}, we learn scores w^(b) and normalize them as α^(b) = softmax(w^(b)). The representation for band b is
+
+m^(b) = ∑_(ℓ∈B_b) α_ℓ^(b) h_ℓ,
+
+where h_ℓ ∈ R^H is the target hidden state from layer ℓ. The learned mixture combines information from multiple layers instead of relying on a single manually selected layer.
+
+Cross-band fusion. The three band representations are concatenated and projected to the draft hidden size:
+
+h_in^D = W_fuse [m^(early); m^(middle); m^(late)],
+
+where W_fuse ∈ R^(H×3H). After normalization, h_in^D is passed to the draft model as its target conditioning feature.
+
+Layer-Band Fusion requires no additional target forward passes and leaves the rest of the EAGLE-3 architecture unchanged. It adds only the small overhead of mixing the extracted hidden states within each band.
+
+Figure caption
+
+Figure 2: Layer-Band Fusion. Hidden states from the frozen target model are grouped into early, middle, and late depth bands. Within each band, learned softmax weights combine the layer representations into a single summary m^(b). The three summaries are concatenated and projected from 3H to H to produce the conditioning feature h_in^D for the draft model. This replaces EAGLE-3’s manually selected layers with learned mixtures while preserving its early-, middle-, and late-depth structure.
+
