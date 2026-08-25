@@ -13,7 +13,7 @@ One important correction: the original indexing was inconsistent. If (a_t) repla
 
 ## Problem
 
-Draft models are typically trained with divergence objectives that match the target’s full distribution at a given context. Speculative-decoding acceptance, however, depends on the probabilities that the draft and target assign to the proposed tokens—usually drawn from a small set of plausible candidates. Neither forward nor reverse KL directly supervises the relative spacing among these candidates. Forward KL encourages broad coverage, whereas reverse KL is more mode-seeking; in both cases, the margins that influence acceptance emerge only indirectly from the overall distribution-matching objective.
+Draft models are typically trained to match the target’s full distribution at a given context, whereas speculative-decoding acceptance is determined by the probabilities assigned to individual proposed tokens. Because these proposals usually come from a small set of plausible candidates, acceptance is particularly sensitive to the relative probability margins within that set. Neither forward nor reverse KL directly supervises the relative spacing among these candidates. Forward KL encourages broad coverage, whereas reverse KL is more mode-seeking; in both cases, the margins that influence acceptance emerge only indirectly from the overall distribution-matching objective.
 
 ## Novelty: Supervising How the Output Shifts
 
@@ -21,11 +21,8 @@ We introduce a logit-shift loss that supervises not only the draft’s output at
 
 ## Motivation
 
-Draft models are commonly trained using objectives such as forward KL, cross-entropy, or reverse KL, which fit the draft’s distribution to the target’s over the entire vocabulary at a given context. Acceptance is determined differently: each proposed token is evaluated using the probabilities assigned to it by the draft and target at that position. In practice, the proposed token usually belongs to a small set of plausible candidates. Because most vocabulary items carry negligible probability, the overall divergence can be low even when the draft misjudges the relative margins among these leading candidates.
+Full-distribution matching does not directly optimize the candidate-level margins that govern acceptance. More importantly, matching these margins at a ground-truth context does not ensure that they change correctly when the preceding token changes. Replacing that token with another plausible candidate may leave the likely continuations largely unchanged while shifting their relative probabilities. Standard distillation supervises the output at each ground-truth context, but not how the output responds to such a replacement. We therefore train the draft to match the target’s logit shift between the original and substituted contexts, while retaining the standard distillation objective to supervise the distributions themselves.
 
-Matching these margins at the ground-truth context is not sufficient because they can depend strongly on the preceding token. Replacing that token with another plausible candidate may leave the general set of possible continuations largely unchanged while substantially altering which continuation is preferred and by how much. Standard distillation at the ground-truth context constrains the margins there, but it does not explicitly supervise how they should change under such a substitution. This matters during autoregressive drafting, where the draft conditions on its own proposed tokens.
-
-We therefore supervise this change directly. Running the target on both the original and substituted contexts and subtracting their logits gives the target’s logit shift, which captures how it re-ranks possible continuations after the preceding token changes. Because the two contexts differ by only one plausible token, much of their shared output structure cancels in the subtraction, emphasizing the change induced by the substitution. Training the draft to reproduce this shift provides supervision that is absent from a single-context objective. The shift loss is added alongside the standard distillation objective rather than replacing it.
 
 ## Method
 
@@ -126,3 +123,17 @@ where (\mathcal{L}_{\mathrm{reg}}) is left unchanged.
 ## Figure caption
 
 **Figure 1: Logit-shift distillation.** At position (t), the draft’s top-1 prediction (a_t) differs from the target’s preferred token ((\textit{puppy}) versus (\textit{dog})) but remains within the target’s top-(k), triggering a substitution. The original context (x_1,\ldots,x_t) and the substituted context (x_1,\ldots,x_{t-1},a_t) are processed by both models to obtain their distributions after position (t). The loss matches the draft’s centered logit shift (\Delta_D) to the target’s shift (\Delta_T), supervising how candidate continuations are re-ranked when the preceding token changes rather than matching the output at either context alone.
+
+
+Method
+
+Substituted context. At position t, let a_t = argmax_v z_v^D(x_{<t}) be the draft’s top-1 prediction. We create a substituted context when a_t ≠ argmax_v z_v^T(x_{<t}) and a_t ∈ top-k(z^T(x_{<t})), with k = 3. The original and substituted contexts are x_{≤t} = (x_1, …, x_t) and x_{≤t}^{sub} = (x_1, …, x_{t-1}, a_t). Thus, the draft’s prediction differs from the target’s top-1 choice but remains plausible under the target.
+
+Logit-shift loss. Define center(z) = z − mean(z). For model M ∈ {T, D}, its logit shift is Δ_M = center(z^M(x_{≤t}^{sub})) − center(z^M(x_{≤t})). We train the draft using L_shift = ‖Δ_D − Δ_T‖_2² and L = L_reg + λL_shift, where λ = 0.1.
+
+Centering removes arbitrary constant offsets that do not affect softmax probabilities. Matching the shift, rather than the full substituted output, removes the structure shared by the two contexts and isolates the change caused by the substituted token.
+
+
+Centering removes arbitrary constant offsets that do not affect softmax probabilities. This prevents the loss from penalizing differences that have no effect on the models’ predictions.
+
+Matching the shift, rather than the full substituted output, cancels the baseline logits that are similar across the original and substituted contexts and isolates the change caused by the substituted token. This focuses the loss on how the candidate probabilities should move, instead of repeating the distribution-matching supervision already provided by the standard loss.
