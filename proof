@@ -168,3 +168,34 @@ Figure caption
 
 Figure 2: Layer-Band Fusion. Hidden states from the frozen target model are grouped into early, middle, and late depth bands. Within each band, learned softmax weights combine the layer representations into a single summary m^(b). The three summaries are concatenated and projected from 3H to H to produce the conditioning feature h_in^D for the draft model. This replaces EAGLE-3’s manually selected layers with learned mixtures while preserving its early-, middle-, and late-depth structure.
 
+Problem names
+
+Previous problem: Context-Shift Blindness
+
+Layer-fusion problem: Fixed-Layer Conditioning
+
+You are right about the notation. The figure uses α₁, α₂, and α₃ as the learned parameters passed through softmax, and m^early, m^middle, and m^late as the resulting band summaries. The method should use the same notation.
+
+Method
+
+Band construction. The target layers are divided into three depth bands: B_early, B_middle, and B_late.
+
+Within-band mixing. Each band has a learned weight vector: α₁ for the early band, α₂ for the middle band, and α₃ for the late band. The band summaries are
+
+m^early = ∑_(ℓ∈B_early) softmax(α₁)_ℓ h_ℓ,
+
+m^middle = ∑_(ℓ∈B_middle) softmax(α₂)_ℓ h_ℓ,
+
+m^late = ∑_(ℓ∈B_late) softmax(α₃)_ℓ h_ℓ,
+
+where h_ℓ ∈ R^H is the target hidden state from layer ℓ. Each summary therefore combines information from all layers in its band.
+
+Cross-band fusion. The three summaries are concatenated and projected from 3H to H:
+
+h_in^D = FC([m^early; m^middle; m^late]).
+
+After normalization, h_in^D is passed to the draft model as its target conditioning feature.
+
+Figure caption
+
+Figure 2: Layer-Band Fusion. Hidden states from the frozen target model are grouped into early, middle, and late bands. Within each band, learned weights α₁, α₂, and α₃ are normalized with softmax and used to produce the weighted summaries m^early, m^middle, and m^late. The three summaries are concatenated and projected from 3H to H to form the draft model’s conditioning feature.
